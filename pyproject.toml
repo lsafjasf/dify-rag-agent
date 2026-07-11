@@ -27,7 +27,10 @@ reranker = [
 ]
 
 [tool.setuptools]
-py-modules = ["text_cleaner", "main"]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["dify_rag*"]
 
 [tool.ruff]
 target-version = "py311"

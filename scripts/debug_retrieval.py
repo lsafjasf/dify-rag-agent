@@ -3,16 +3,19 @@
 帮助你判断是「标注错了」还是「检索真的没找到」。
 
 用法:
-  python debug_retrieval.py           # 只显示失败的问题
-  python debug_retrieval.py --all     # 显示全部 30 条
+  python scripts/debug_retrieval.py           # 只显示失败的问题
+  python scripts/debug_retrieval.py --all     # 显示全部 30 条
 """
 from __future__ import annotations
 
 import sys
-from main import retrieve_docs, ensure_index
-from eval_dataset import get_default_dataset
+
+from dify_rag.retrieval import retrieve_docs
+from dify_rag.vectorstore import ensure_index
+from dify_rag.eval.dataset import get_default_dataset
 
 K = 5
+
 
 def run(show_all: bool = False):
     ensure_index()
@@ -42,12 +45,11 @@ def run(show_all: bool = False):
         failed += 0 if is_hit else 1
 
         print(f"\n{'=' * 70}")
-        print(f"[{status}] #{i+1} | {sample.question}")
+        print(f"[{status}] #{i + 1} | {sample.question}")
         print(f"  期望来源: {sample.relevant_sources}")
         print(f"  实际检索 (Top-{K}):")
         for rank, src, matched in hits:
-            marker = " ✅" if matched else "   "
-            # 只显示文件名，不显示完整路径
+            marker = " OK" if matched else "   "
             filename = src.replace("\\", "/").split("/")[-1] if src else "?"
             print(f"    [{rank}] {marker} {filename}")
             print(f"         {src}")

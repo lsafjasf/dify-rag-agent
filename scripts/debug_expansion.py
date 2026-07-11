@@ -1,13 +1,11 @@
 """调试查询扩展效果"""
-import os, sys
-os.environ["PYTHONIOENCODING"] = "utf-8"
-sys.path.insert(0, os.path.dirname(__file__))
+from dify_rag.llm import get_llm
+from dify_rag.vectorstore import get_vectorstore
+from dify_rag.config import CHROMA_PERSIST_DIR
+from dify_rag.hybrid_retriever import get_hybrid_retriever
 
-from main import _get_llm, _get_vectorstore, CHROMA_PERSIST_DIR
-from hybrid_retriever import get_hybrid_retriever
-
-vectorstore = _get_vectorstore(CHROMA_PERSIST_DIR)
-llm = _get_llm()
+vectorstore = get_vectorstore(CHROMA_PERSIST_DIR)
+llm = get_llm()
 hybrid = get_hybrid_retriever(vectorstore)
 hybrid.set_llm(llm)
 

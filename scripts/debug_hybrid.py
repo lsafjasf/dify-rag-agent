@@ -1,9 +1,6 @@
-"""调试混合检索在 6 条失败查询上的表现."""
-import os, sys
-os.environ["PYTHONIOENCODING"] = "utf-8"
-sys.path.insert(0, os.path.dirname(__file__))
-
-from main import retrieve_docs, ensure_index
+"""调试混合检索在失败查询上的表现."""
+from dify_rag.retrieval import retrieve_docs
+from dify_rag.vectorstore import ensure_index
 
 ensure_index()
 

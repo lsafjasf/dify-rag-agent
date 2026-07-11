@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from eval_dataset import EvalSample
+from dify_rag.eval.dataset import EvalSample
 
 
 # ---------------------------------------------------------------------------
