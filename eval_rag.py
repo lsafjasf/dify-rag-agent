@@ -22,6 +22,8 @@ RAG 效果评估引擎
 from __future__ import annotations
 
 import json
+import math
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -30,42 +32,212 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from eval_dataset import EvalSample
 
+
 # ---------------------------------------------------------------------------
-# 可选依赖检测
+# 轻量级 RAGAS 指标实现 (零外部依赖, 基于现有 LLM + Embedding)
 # ---------------------------------------------------------------------------
 
-RAGAS_AVAILABLE = False
-RAGAS_VERSION: Optional[str] = None
 
-try:
-    import ragas  # noqa: F401
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    """计算两个向量的余弦相似度。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
-    # 检测 RAGAS 版本
-    try:
-        from ragas.dataset_schema import SingleTurnSample  # noqa: F401
-        from ragas.metrics import (  # noqa: F401
-            AnswerCorrectness,
-            AnswerRelevancy,
-            Faithfulness,
-            LLMContextPrecisionWithoutReference,
-        )
 
-        RAGAS_AVAILABLE = True
-        RAGAS_VERSION = "0.2.x"
-    except ImportError:
+def _call_llm_json(llm, prompt: str, max_retries: int = 2) -> dict:
+    """调用 LLM 并尝试从响应中提取 JSON。"""
+    for attempt in range(max_retries):
         try:
-            from ragas.metrics import (  # noqa: F401
-                answer_correctness,
-                answer_relevancy,
-                faithfulness,
-            )
+            response = llm.invoke(prompt)
+            text = response.content if hasattr(response, "content") else str(response)
+            # 尝试直接解析
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+            # 尝试匹配 ```json ... ``` 代码块
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+            if m:
+                try:
+                    return json.loads(m.group(1))
+                except json.JSONDecodeError:
+                    pass
+            # 尝试匹配 { ... }
+            m = re.search(r"\{[\s\S]*\}", text)
+            if m:
+                try:
+                    return json.loads(m.group())
+                except json.JSONDecodeError:
+                    pass
+            return {}
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(1.0 * (attempt + 1))
+            else:
+                return {}
+    return {}
 
-            RAGAS_AVAILABLE = True
-            RAGAS_VERSION = "0.1.x"
-        except ImportError:
-            RAGAS_AVAILABLE = False
-except ImportError:
-    RAGAS_AVAILABLE = False
+
+def _eval_faithfulness(question: str, answer: str, contexts: List[str], llm) -> float:
+    """评估忠实度: 回答是否能从检索到的上下文中推断出来。
+
+    1. 让 LLM 把回答拆解为独立陈述 (claims)
+    2. 逐一判断每个陈述是否被上下文支持
+    3. faithfulness = 被支持的陈述数 / 总陈述数
+    """
+    if not answer.strip() or not contexts:
+        return 0.0
+
+    ctx_text = "\n\n---\n\n".join(
+        f"[{i + 1}] {c}" for i, c in enumerate(contexts)
+    )
+
+    prompt = f"""你是一个严格的评估助手。请评估以下回答是否忠实于提供的参考上下文。
+
+## 问题
+{question}
+
+## 参考上下文
+{ctx_text}
+
+## 回答
+{answer}
+
+## 任务
+1. 将回答拆解为独立的陈述句 (claims)，每个陈述句应是一个可以独立验证的事实断言。
+2. 逐一判断每个陈述句是否可以从参考上下文中推断或得到支持。
+3. 以 JSON 格式返回结果，不要输出其他内容。
+
+返回格式：
+{{"claims": [{{"statement": "陈述内容", "supported": true/false, "reason": "判断依据"}}]}}"""
+
+    result = _call_llm_json(llm, prompt)
+    claims = result.get("claims", [])
+    if not claims:
+        return 0.5  # 无法解析时返回中间值
+
+    supported = sum(1 for c in claims if c.get("supported", False))
+    return supported / len(claims)
+
+
+def _eval_answer_relevancy(
+    question: str, answer: str, llm, embeddings
+) -> float:
+    """评估回答相关性: 回答是否切题。
+
+    1. 让 LLM 根据回答生成 3 个可能触发该回答的问题
+    2. 用 embedding 计算生成问题与原问题的余弦相似度
+    3. relevancy = 平均相似度
+    """
+    if not answer.strip():
+        return 0.0
+
+    prompt = f"""针对以下回答，生成 3 个该回答能够回答的问题。问题应语义多样但都与回答内容相关。
+
+## 回答
+{answer}
+
+返回格式：
+{{"questions": ["问题1", "问题2", "问题3"]}}"""
+
+    result = _call_llm_json(llm, prompt)
+    generated = result.get("questions", [])
+    if not generated or len(generated) < 1:
+        return 0.5
+
+    try:
+        orig_emb = embeddings.embed_query(question)
+        sims = []
+        for gq in generated:
+            gen_emb = embeddings.embed_query(gq)
+            sims.append(_cosine_similarity(orig_emb, gen_emb))
+        return sum(sims) / len(sims)
+    except Exception:
+        return 0.5
+
+
+def _eval_context_precision(
+    question: str, contexts: List[str], llm
+) -> float:
+    """评估上下文精度: 检索到的上下文是否与问题相关。
+
+    1. 让 LLM 逐一判断每个上下文片段与问题的相关性
+    2. precision = 相关的上下文数 / 总上下文数
+    """
+    if not contexts:
+        return 0.0
+
+    ctx_list = "\n\n".join(
+        f"[{i + 1}] {c[:400]}" for i, c in enumerate(contexts)
+    )
+
+    prompt = f"""判断以下每个上下文片段是否与回答该问题相关。
+
+## 问题
+{question}
+
+## 上下文片段
+{ctx_list}
+
+返回格式（数组长度必须为 {len(contexts)}）：
+{{"relevant": [true/false, ...]}}"""
+
+    result = _call_llm_json(llm, prompt)
+    relevant = result.get("relevant", [])
+    if not relevant or len(relevant) != len(contexts):
+        return 0.5
+
+    return sum(1 for r in relevant if r) / len(relevant)
+
+
+def _eval_answer_correctness(
+    question: str, answer: str, ground_truth: str, llm, embeddings
+) -> float:
+    """评估答案正确性: 回答与参考答案的一致程度。
+
+    综合两个维度:
+    - LLM 语义评分 (权重 60%): 让 LLM 判断事实正确性和完整性
+    - Embedding 相似度 (权重 40%): 计算回答与参考答案的语义向量相似度
+    """
+    if not answer.strip() or not ground_truth.strip():
+        return 0.0
+
+    # 1) Embedding 语义相似度
+    try:
+        ans_emb = embeddings.embed_query(answer)
+        gt_emb = embeddings.embed_query(ground_truth)
+        semantic_score = _cosine_similarity(ans_emb, gt_emb)
+    except Exception:
+        semantic_score = 0.5
+
+    # 2) LLM 语义评判
+    prompt = f"""评估以下回答与参考答案的一致程度，考虑事实正确性和信息完整性。
+
+## 问题
+{question}
+
+## 回答
+{answer}
+
+## 参考答案
+{ground_truth}
+
+返回格式：
+{{"correctness": 0.0-1.0的分数, "reason": "简短评估"}}"""
+
+    result = _call_llm_json(llm, prompt)
+    try:
+        llm_score = float(result.get("correctness", semantic_score))
+        llm_score = max(0.0, min(1.0, llm_score))
+    except (TypeError, ValueError):
+        llm_score = semantic_score
+
+    # 综合: LLM 60% + Embedding 40%
+    return 0.6 * llm_score + 0.4 * semantic_score
 
 
 # ---------------------------------------------------------------------------
@@ -286,125 +458,88 @@ def evaluate_ragas(
     llm,
     embeddings,
 ) -> RAGASReport:
-    """使用 RAGAS 运行全链路评估。
+    """使用内置轻量指标运行全链路评估 (无需 ragas 依赖)。
+
+    对每条样本顺序计算 4 个指标:
+    - Faithfulness: 回答是否忠实于检索上下文
+    - Answer Relevancy: 回答是否切题
+    - Context Precision: 检索到的上下文是否与问题相关
+    - Answer Correctness: 回答与参考答案的一致程度 (需要 ground_truth)
 
     Args:
         dataset: 评估样本列表。
-        generated_results: 每个样本的生成结果, 格式:
-            [{"question": str, "answer": str, "contexts": List[str]}, ...]
-        llm: LangChain LLM 实例 (用于 RAGAS judge)。
-        embeddings: LangChain Embeddings 实例 (用于 RAGAS 部分指标)。
+        generated_results: [{"question": str, "answer": str, "contexts": [str]}, ...]
+        llm: LangChain LLM 实例。
+        embeddings: Embeddings 实例 (有 embed_query 方法)。
 
     Returns:
         RAGASReport 对象。
-
-    Raises:
-        ImportError: 如果 ragas 未安装。
     """
-    if not RAGAS_AVAILABLE:
-        raise ImportError(
-            "RAGAS 未安装。请执行: pip install ragas"
-        )
+    n = len(dataset)
+    faith_scores: List[float] = []
+    relevancy_scores: List[float] = []
+    precision_scores: List[float] = []
+    correctness_scores: List[float] = []
+    per_sample: List[Dict[str, Any]] = []
 
-    from langchain_openai import ChatOpenAI
+    for i, (sample, gen) in enumerate(zip(dataset, generated_results)):
+        question = gen["question"]
+        answer = gen["answer"]
+        contexts = gen.get("contexts", [])
 
-    # 包装 LLM 为 RAGAS 兼容格式
-    try:
-        from ragas.llms import LangchainLLMWrapper
-        judge_llm = LangchainLLMWrapper(llm)
-    except ImportError:
-        judge_llm = llm
+        entry: Dict[str, Any] = {"question": question[:60]}
 
-    # 包装 Embeddings
-    try:
-        from ragas.embeddings import LangchainEmbeddingsWrapper
-        judge_embeddings = LangchainEmbeddingsWrapper(embeddings)
-    except ImportError:
-        judge_embeddings = embeddings
-
-    # 构建 RAGAS 样本
-    if RAGAS_VERSION and RAGAS_VERSION.startswith("0.2"):
-        # RAGAS 0.2.x API
-        from ragas import evaluate
-        from ragas.dataset_schema import SingleTurnSample
-        from ragas.metrics import (
-            AnswerCorrectness,
-            AnswerRelevancy,
-            Faithfulness,
-            LLMContextPrecisionWithoutReference,
-        )
-
-        samples = []
-        for item, sample in zip(generated_results, dataset):
-            samples.append(SingleTurnSample(
-                user_input=item["question"],
-                response=item["answer"],
-                retrieved_contexts=item["contexts"],
-                reference=sample.ground_truth_answer or None,
-            ))
-
-        metrics = [
-            Faithfulness(llm=judge_llm),
-            AnswerRelevancy(llm=judge_llm, embeddings=judge_embeddings),
-            LLMContextPrecisionWithoutReference(llm=judge_llm),
-        ]
-        if any(s.ground_truth_answer for s in dataset):
-            metrics.append(AnswerCorrectness(llm=judge_llm, embeddings=judge_embeddings))
-
-        result = evaluate(
-            metrics=metrics,
-            dataset=samples,
-        )
-
-    elif RAGAS_VERSION and RAGAS_VERSION.startswith("0.1"):
-        # RAGAS 0.1.x API (旧版)
-        from ragas import evaluate
-        from ragas.metrics import (
-            answer_correctness,
-            answer_relevancy,
-            faithfulness,
-        )
-
-        ds = {
-            "question": [],
-            "answer": [],
-            "contexts": [],
-            "ground_truth": [],
-        }
-        for item, sample in zip(generated_results, dataset):
-            ds["question"].append(item["question"])
-            ds["answer"].append(item["answer"])
-            ds["contexts"].append(item["contexts"])
-            ds["ground_truth"].append(sample.ground_truth_answer or "")
-
-        from datasets import Dataset
-        hf_dataset = Dataset.from_dict(ds)
-
-        result = evaluate(
-            metrics=[faithfulness, answer_relevancy, answer_correctness],
-            dataset=hf_dataset,
-        )
-    else:
-        raise RuntimeError("RAGAS 版本无法识别")
-
-    # 解析结果
-    result_dict = dict(result) if hasattr(result, "__iter__") else {}
-
-    def _safe_float(key: str) -> float:
-        v = result_dict.get(key, 0.0)
-        if v is None:
-            return 0.0
+        # 1) Faithfulness
         try:
-            return float(v)
-        except (TypeError, ValueError):
-            return 0.0
+            f = _eval_faithfulness(question, answer, contexts, llm)
+            faith_scores.append(f)
+            entry["faithfulness"] = round(f, 4)
+        except Exception:
+            faith_scores.append(0.0)
+            entry["faithfulness"] = 0.0
+
+        # 2) Answer Relevancy
+        try:
+            ar = _eval_answer_relevancy(question, answer, llm, embeddings)
+            relevancy_scores.append(ar)
+            entry["answer_relevancy"] = round(ar, 4)
+        except Exception:
+            relevancy_scores.append(0.0)
+            entry["answer_relevancy"] = 0.0
+
+        # 3) Context Precision
+        try:
+            cp = _eval_context_precision(question, contexts, llm)
+            precision_scores.append(cp)
+            entry["context_precision"] = round(cp, 4)
+        except Exception:
+            precision_scores.append(0.0)
+            entry["context_precision"] = 0.0
+
+        # 4) Answer Correctness (有参考答案时才计算)
+        if sample.ground_truth_answer:
+            try:
+                ac = _eval_answer_correctness(
+                    question, answer, sample.ground_truth_answer, llm, embeddings
+                )
+                correctness_scores.append(ac)
+                entry["answer_correctness"] = round(ac, 4)
+            except Exception:
+                pass  # 不参与平均
+
+        per_sample.append(entry)
 
     report = RAGASReport(
-        faithfulness=_safe_float("faithfulness"),
-        answer_relevancy=_safe_float("answer_relevancy"),
-        context_precision=_safe_float("llm_context_precision_without_reference"),
-        answer_correctness=_safe_float("answer_correctness"),
-        total_questions=len(dataset),
+        faithfulness=sum(faith_scores) / n if n else 0.0,
+        answer_relevancy=sum(relevancy_scores) / n if n else 0.0,
+        context_precision=sum(precision_scores) / n if n else 0.0,
+        answer_correctness=(
+            sum(correctness_scores) / len(correctness_scores)
+            if correctness_scores
+            else 0.0
+        ),
+        total_questions=n,
+        per_sample=per_sample,
     )
 
     return report
@@ -524,17 +659,15 @@ def run_evaluation(
                 q_preview = dataset[i].question[:50]
                 print(f"   {status} [{i+1:2d}] {q_preview}...{rank_str}")
 
-    # ---- RAGAS 评估 ----
+    # ---- 全链路评估 (内置轻量指标, 无需 ragas) ----
     if mode in ("ragas", "all"):
-        if not RAGAS_AVAILABLE:
-            print("⚠️ RAGAS 未安装, 跳过全链路评估。执行: pip install ragas")
-        elif llm is None:
-            print("⚠️ 缺少 LLM 实例, 跳过 RAGAS 评估。")
+        if llm is None:
+            print("⚠️ 缺少 LLM 实例, 跳过全链路评估。")
         elif retrieve_fn is None:
-            print("⚠️ 缺少 retrieve_fn, 跳过 RAGAS 评估。")
+            print("⚠️ 缺少 retrieve_fn, 跳过全链路评估。")
         else:
             if verbose:
-                print(f"\n🧪 运行 RAGAS 全链路评估...")
+                print(f"\n🧪 运行全链路评估 (内置指标)...")
 
             # 先生成所有回答
             for i, sample in enumerate(dataset):
@@ -571,7 +704,7 @@ def run_evaluation(
                         "contexts": [],
                     })
 
-            # 运行 RAGAS
+            # 运行全链路评估
             try:
                 report.ragas = evaluate_ragas(
                     dataset=dataset,
@@ -580,10 +713,10 @@ def run_evaluation(
                     embeddings=embeddings,
                 )
                 if verbose:
-                    print(f"   ✅ RAGAS 评估完成")
+                    print(f"   ✅ 全链路评估完成")
             except Exception as exc:
                 if verbose:
-                    print(f"   ⚠️ RAGAS 评估失败: {exc}")
+                    print(f"   ⚠️ 全链路评估失败: {exc}")
 
     # 保存逐样本详情
     for i, sample in enumerate(dataset):

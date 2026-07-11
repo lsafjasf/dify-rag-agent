@@ -46,7 +46,8 @@ except ImportError:
 
 from text_cleaner import build_rag_documents
 from eval_dataset import get_default_dataset, load_dataset_from_json, dataset_summary
-from eval_rag import run_evaluation, save_report, EvalReport, RAGAS_AVAILABLE
+from eval_rag import run_evaluation, save_report, EvalReport
+from hybrid_retriever import get_hybrid_retriever
 
 # ---------------------------------------------------------------------------
 # 配置 (从 .env / 环境变量读取)
@@ -241,7 +242,7 @@ def _check_config():
 
 
 def retrieve_docs(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K):
-    """检索 top-k 相关文档片段 (纯检索, 不生成)。
+    """混合检索 (BM25 + 向量 + RRF 重排) top-k 相关文档片段。
 
     Args:
         question: 用户问题。
@@ -255,11 +256,8 @@ def retrieve_docs(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: i
         raise RuntimeError("请安装 langchain-chroma chromadb: pip install langchain-chroma chromadb")
 
     vectorstore = _get_vectorstore(persist_dir)
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": top_k},
-    )
-    return retriever.invoke(question)
+    hybrid = get_hybrid_retriever(vectorstore)
+    return hybrid.hybrid_search(question, top_k)
 
 
 def _get_llm():
@@ -546,10 +544,6 @@ def _run_eval_cli(eval_args: dict) -> None:
 
     # 运行评估
     mode = eval_args["mode"]
-    if mode == "ragas" and not RAGAS_AVAILABLE:
-        print("\n⚠️ RAGAS 未安装, 将仅运行检索评估。")
-        print("   安装 RAGAS: pip install ragas")
-        mode = "retrieval"
 
     report = run_evaluation(
         dataset=dataset,
