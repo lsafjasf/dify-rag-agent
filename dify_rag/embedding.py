@@ -31,8 +31,14 @@ class DashScopeEmbeddings(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    def _call_api(self, texts: List[str]) -> List[List[float]]:
-        """调用百炼原生 embedding API, 带重试。"""
+    def _call_api(self, texts: List[str], text_type: str = "document") -> List[List[float]]:
+        """调用百炼原生 embedding API, 带重试。
+
+        Args:
+            texts: 待编码文本列表。
+            text_type: text-embedding-v4 必须区分 "query" (检索) 和 "document" (入库)。
+                       v1/v3 忽略此参数。
+        """
         # 过滤空白
         texts = [t for t in texts if t.strip()]
         if not texts:
@@ -45,6 +51,7 @@ class DashScopeEmbeddings(BaseModel):
         payload = {
             "model": self.model,
             "input": {"texts": texts},
+            "parameters": {"text_type": text_type},
         }
 
         last_error = None
@@ -81,17 +88,17 @@ class DashScopeEmbeddings(BaseModel):
         raise RuntimeError(f"百炼 Embedding API 调用失败: {last_error}")
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """批量 embedding, Chroma 入库用。"""
-        batch_size = 20
+        """批量 embedding, Chroma 入库用 — 使用 text_type="document"。"""
+        batch_size = 10  # text-embedding-v4 限制每批最多 10 条
         all_embeddings: List[List[float]] = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
-            all_embeddings.extend(self._call_api(batch))
+            all_embeddings.extend(self._call_api(batch, text_type="document"))
         return all_embeddings
 
     def embed_query(self, text: str) -> List[float]:
-        """单条 embedding, 检索用。"""
-        results = self._call_api([text])
+        """单条 embedding, 检索用 — 使用 text_type="query"。"""
+        results = self._call_api([text], text_type="query")
         if results:
             return results[0]
         raise RuntimeError("Embedding 返回为空")

@@ -28,6 +28,13 @@ CHROMA_PERSIST_DIR = os.environ.get("CHROMA_DIR", "./chroma_db")
 # ---------------------------------------------------------------------------
 
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-v1")
+
+# Chroma collection 名: 按模型隔离, 不同 embedding 模型使用不同 collection
+# 旧 v1 数据保留在 "langchain" (langchain_chroma 默认名) 中不受影响
+CHROMA_COLLECTION_NAME = os.environ.get(
+    "CHROMA_COLLECTION_NAME",
+    f"dify_docs_{EMBEDDING_MODEL}",
+)
 EMBEDDING_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "") or os.environ.get("EMBEDDING_API_KEY", "")
 EMBEDDING_URL = os.environ.get(
     "EMBEDDING_URL",

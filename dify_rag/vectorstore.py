@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dify_rag.config import CHROMA_PERSIST_DIR, DIFY_DOCS_DIR
+from dify_rag.config import CHROMA_PERSIST_DIR, CHROMA_COLLECTION_NAME, DIFY_DOCS_DIR
 
 _vectorstore_cache = None
 
@@ -31,20 +31,22 @@ def get_vectorstore(persist_dir: str = CHROMA_PERSIST_DIR):
     _vectorstore_cache = Chroma(
         embedding_function=embeddings,
         persist_directory=persist_dir,
+        collection_name=CHROMA_COLLECTION_NAME,
     )
     return _vectorstore_cache
 
 
 def _collection_has_data(persist_dir: str) -> bool:
-    """检查 Chroma 集合是否包含实际记录。"""
+    """检查当前模型的 Chroma collection 是否包含实际记录。"""
     try:
         import chromadb
 
         client = chromadb.PersistentClient(path=persist_dir)
-        collections = client.list_collections()
-        if not collections:
+        try:
+            collection = client.get_collection(name=CHROMA_COLLECTION_NAME)
+            return collection.count() > 0
+        except Exception:
             return False
-        return any(c.count() > 0 for c in collections)
     except Exception:
         return False
 
@@ -57,7 +59,7 @@ def ensure_index(
     global _vectorstore_cache
 
     if Path(persist_dir).exists() and _collection_has_data(persist_dir):
-        print(f"✅ 向量库已存在且包含数据: {persist_dir}")
+        print(f"✅ 向量库已存在且包含数据: {persist_dir}  (collection: {CHROMA_COLLECTION_NAME})")
         get_vectorstore(persist_dir)  # 预热缓存
         return
 
@@ -87,6 +89,7 @@ def ensure_index(
         documents=documents,
         embedding=embeddings,
         persist_directory=persist_dir,
+        collection_name=CHROMA_COLLECTION_NAME,
     )
     print(f"💾 向量库已持久化至: {persist_dir}")
     print(f"📊 共 {_vectorstore_cache._collection.count()} 条记录")
