@@ -1,0 +1,698 @@
+"""
+Dify 中文文档文本清洗模块
+======================
+用于 RAG Agent 的文本预处理流水线。
+
+处理步骤:
+  1. 文件发现 —— 遍历目录, 收集 .mdx / .json 文件
+  2. Frontmatter 提取 —— 解析 YAML 头, 分离元数据与正文
+  3. JSX/MDX 组件剥离 —— 移除 <Info>、<Card> 等组件标签, 保留内部文字
+  4. HTML 标签清理 —— 去除 <div>、<a> 等 HTML 标签
+  5. Markdown 整理 —— 保留标题结构, 清理图片/链接语法
+  6. 空白规范化 —— 合并多余空行, 统一中英文空格
+  7. 文本分块 —— 使用 LangChain splitter 切分为 RAG 可用片段
+  8. 输出 Document —— 生成带元数据的 LangChain Document 列表
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+# 需要移除标签但保留内部文字的 MDX 组件 (配对标签)
+MDX_PAIRED_COMPONENTS = [
+    "Info", "Warning", "Note", "Tip", "Check",
+    "Card", "CardGroup",
+    "Frame",
+    "Steps", "Step",
+    "Accordion", "AccordionGroup",
+    "Columns",
+    "Tabs", "Tab",
+]
+
+# 纯装饰性组件 (自闭合, 无文字内容, 完全删除)
+MDX_SELF_CLOSING_COMPONENTS = [
+    "Frame",  # <Frame /> 也是自闭合的
+]
+
+# HTML 标签 —— 剥离标签, 保留内部文字
+HTML_TAGS = [
+    "div", "span", "p", "h1", "h2", "h3", "h4", "h5", "h6",
+    "strong", "em", "b", "i", "u", "code", "pre",
+    "a", "img", "br", "hr",
+    "ul", "ol", "li",
+    "table", "thead", "tbody", "tr", "th", "td",
+    "section", "article", "header", "footer", "nav",
+]
+
+# AI 翻译声明行模式
+AI_TRANSLATION_PATTERN = re.compile(
+    r"> 本文档由 AI 自动翻译。如有任何不准确之处，请参考 \[英文原版\]\(.*?\)\s*"
+)
+
+# Markdown 图片: ![alt](url)
+MD_IMAGE_PATTERN = re.compile(r"!\[.*?\]\(.*?\)")
+
+# Markdown 链接: [text](url) → 保留 text
+MD_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+
+# --------------------------------------------------------
+# 数据结构
+# --------------------------------------------------------
+
+
+@dataclass
+class CleanConfig:
+    """文本清洗配置"""
+
+    # 是否保留 Markdown 标题 (##, ### 等)
+    keep_headers: bool = True
+
+    # 是否移除 AI 翻译声明
+    remove_translation_notice: bool = True
+
+    # 最小行长度 (短于此值的行视为碎片, 会被移除)
+    min_line_length: int = 2
+
+    # 连续空行合并阈值 (超过 N 个空行合并为 1 个)
+    max_consecutive_newlines: int = 2
+
+    # 分块大小 (字符数, 中文约 2 字符 = 1 token)
+    chunk_size: int = 800
+
+    # 分块重叠大小
+    chunk_overlap: int = 150
+
+    # 文档来源根目录 (写入 metadata)
+    source_root: str = ""
+
+    # 需要处理的文件后缀
+    extensions: tuple[str, ...] = (".mdx", ".md")
+
+    # 是否保留代码块
+    keep_code_blocks: bool = True
+
+
+@dataclass
+class CleanedDocument:
+    """清洗后的单篇文档"""
+
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    source_path: str = ""
+
+
+# --------------------------------------------------------
+# 核心清洗逻辑
+# --------------------------------------------------------
+
+
+def discover_files(root: str | Path, extensions: tuple[str, ...] | None = None) -> list[Path]:
+    """递归发现所有文档文件。
+
+    Args:
+        root: 文档根目录。
+        extensions: 目标文件后缀, 默认 (".mdx", ".md")。
+
+    Returns:
+        按路径排序的文件列表。
+    """
+    if extensions is None:
+        extensions = (".mdx", ".md")
+
+    root = Path(root)
+    files: list[Path] = []
+    for ext in extensions:
+        files.extend(root.rglob(f"*{ext}"))
+    return sorted(files)
+
+
+def extract_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    """从 MDX 文本中提取 YAML frontmatter。
+
+    首行必须是 `---`, 否则整个文本视为正文。
+
+    Args:
+        text: 原始 MDX 文本。
+
+    Returns:
+        (metadata_dict, body_text) 元组。metadata 可能为空 dict。
+    """
+    text = text.strip()
+    if not text.startswith("---"):
+        return {}, text
+
+    # 找第二个 ---
+    rest = text[3:]  # 跳过首个 ---
+    end_idx = rest.find("\n---")
+    if end_idx == -1:
+        # 第二个 --- 在同一行? 极少数情况
+        end_idx = rest.find("---")
+        if end_idx == -1:
+            return {}, text
+
+    fm_text = rest[:end_idx].strip()
+    body = rest[end_idx + 4:].strip()  # 跳过 \n---
+
+    metadata: dict[str, Any] = {}
+    if fm_text:
+        try:
+            parsed = yaml.safe_load(fm_text)
+            if isinstance(parsed, dict):
+                metadata = parsed
+        except yaml.YAMLError:
+            warnings.warn(f"YAML frontmatter 解析失败, 将跳过", RuntimeWarning)
+
+    return metadata, body
+
+
+def remove_translation_notice(text: str) -> str:
+    """移除 AI 翻译声明行。"""
+    return AI_TRANSLATION_PATTERN.sub("", text)
+
+
+def strip_mdx_tags(text: str) -> str:
+    """剥离 MDX/JSX 组件标签, 保留内部文字。
+
+    策略:
+    1. 反复从内向外剥离配对标签 (无嵌套的最内层优先)。
+    2. 最多迭代 20 轮, 防止死循环。
+    3. 移除残留的自闭合标签。
+
+    Args:
+        text: 包含 MDX 组件的文本。
+
+    Returns:
+        剥离后的纯文本。
+    """
+    all_components = "|".join(MDX_PAIRED_COMPONENTS)
+
+    # 配对标签模式: <Tag props...>content</Tag>
+    # 要求内部 content 不包含同类型标签 (即匹配最内层)
+    paired_pattern = re.compile(
+        rf"<({all_components})(?:\s[^>]*)?>\s*(.*?)\s*</\1>",
+        re.DOTALL,
+    )
+
+    max_iterations = 20
+    for _ in range(max_iterations):
+        new_text = paired_pattern.sub(r"\2", text)
+        if new_text == text:
+            break
+        text = new_text
+
+    # 自闭合标签: <Tag ... />
+    self_closing_pattern = re.compile(
+        rf"<({all_components})(?:\s[^>]*)?\s*/\s*>",
+    )
+    text = self_closing_pattern.sub("", text)
+
+    return text
+
+
+def strip_html_tags(text: str) -> str:
+    """剥离 HTML 标签, 保留内部文字。
+
+    同时处理:
+    - `<tag>` / `</tag>` / `<tag ...>`
+    - `<tag />` 自闭合
+    - HTML 注释 `<!-- ... -->`
+
+    Args:
+        text: 含 HTML 的文本。
+
+    Returns:
+        剥离后的纯文本。
+    """
+    # 注释
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+
+    # 所有 HTML 标签 (配对或自闭合)
+    text = re.sub(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^>]*)?\s*/?>", "", text)
+
+    return text
+
+
+def clean_markdown(text: str, keep_headers: bool = True) -> str:
+    """清理 Markdown 标记, 使文本更适合 embedding。
+
+    - 图片：完全移除 `![alt](url)`
+    - 链接：保留文字 `[text](url)` → `text`
+    - 粗体/斜体：保留文字
+    - 行内代码：保留代码文字
+    - 代码块：可选保留内容
+    - 标题：可选保留 `#` 标记
+
+    Args:
+        text: Markdown 文本。
+        keep_headers: 是否保留 # 标题前缀。
+
+    Returns:
+        清洗后的文本。
+    """
+    # 图片
+    text = MD_IMAGE_PATTERN.sub("", text)
+
+    # 链接 → 保留链接文字
+    text = MD_LINK_PATTERN.sub(r"\1", text)
+
+    # 粗体/斜体: **text** / *text* → text
+    # 注意: 只处理 * 包裹的强调, 不用 _ 因为 _ 在技术文档中频繁出现于
+    # 变量名 (user_file, voice_and_tone) 和 URL 路径中, 误删风险极高。
+    text = re.sub(r"\*{1,2}([^*\n]+?)\*{1,2}", r"\1", text)
+
+    # 下划线斜体: 仅匹配空白符包围的 _word_ 模式,
+    # 避免误伤 snake_case 标识符 (user_file 等)。
+    text = re.sub(r"(?<=\s)_([^_\s]+?)_(?=\s|$|[.,!?;:，。！？；：)])", r"\1", text)
+    # 行首的 _word_  (没有前置空白, 单独处理)
+    text = re.sub(r"^_([^_\s]+?)_(?=\s|$|[.,!?;:，。！？；：)])", r"\1", text, flags=re.MULTILINE)
+
+    # 删除线 ~~text~~ → text
+    text = re.sub(r"~~([^~]+?)~~", r"\1", text)
+
+    # 行内代码 `code` → code
+    text = re.sub(r"`([^`]+?)`", r"\1", text)
+
+    # 代码块围栏标记: ```language / ``` → 移除标记, 保留块内内容
+    text = re.sub(r"^```.*$", "", text, flags=re.MULTILINE)
+
+    # 清理残留的孤立反引号 (紧贴行首或行尾)
+    text = re.sub(r"^`+\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s*`+$", "", text, flags=re.MULTILINE)
+
+    # 如果保留标题, 不变; 否则去掉 #
+    if not keep_headers:
+        text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+
+    return text
+
+
+def normalize_whitespace(
+    text: str,
+    min_line_length: int = 2,
+    max_consecutive_newlines: int = 2,
+) -> str:
+    """规范化空白字符。
+
+    - 合并连续空行 (保留最多 N 个)
+    - 移除过短的无意义行
+    - 统一行首尾空白
+    - 规范化中文全角空格
+
+    Args:
+        text: 待规范文本。
+        min_line_length: 少于该字符数的行会被删除。
+        max_consecutive_newlines: 最多允许的连续换行数。
+
+    Returns:
+        规范化后的文本。
+    """
+    # 合并连续空行
+    pattern = r"\n{" + str(max_consecutive_newlines + 1) + r",}"
+    text = re.sub(pattern, "\n" * max_consecutive_newlines, text)
+
+    # 逐行处理
+    lines = text.split("\n")
+    cleaned: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+
+        # 保留空行 (作为段落分隔)
+        if not stripped:
+            cleaned.append("")
+            continue
+
+        # 过滤过短的无意义行 (但不是标题)
+        if len(stripped) < min_line_length and not stripped.startswith("#"):
+            continue
+
+        # 规范化中文全角空格 → 半角
+        stripped = stripped.replace("　", " ")
+
+        cleaned.append(stripped)
+
+    # 重新组合, 去除首尾空行
+    result = "\n".join(cleaned).strip()
+
+    return result
+
+
+def normalize_chinese_punctuation(text: str) -> str:
+    """规范化中文标点 — 统一全角/半角混用。
+
+    - 中文上下文中的英文逗号 → 中文逗号 (可选)
+    - 清理多余空格 (中文字间不应有无意义空格)
+
+    Args:
+        text: 含中文的文本。
+
+    Returns:
+        规范化后的文本。
+    """
+    # 移除中文字符之间的空格 (中文书写通常无空格)
+    # "这 是 一个 例子" → "这是一个例子"
+    text = re.sub(r"(?<=[一-鿿㐀-䶿])\s+(?=[一-鿿㐀-䶿])", "", text)
+
+    # 中文标点后面多余的英文空格
+    # "你好。 世界" → "你好。世界"
+    text = re.sub(
+        r"(?<=[。，；！？、：])\s+",
+        "",
+        text,
+    )
+
+    return text
+
+
+# --------------------------------------------------------
+# 文档分块 (LangChain 集成)
+# --------------------------------------------------------
+
+
+def chunk_documents(
+    documents: list[CleanedDocument],
+    chunk_size: int = 800,
+    chunk_overlap: int = 150,
+) -> list[dict[str, Any]]:
+    """使用递归字符分割器将文档切分为 RAG 友好的块。
+
+    优先使用 LangChain 的 RecursiveCharacterTextSplitter,
+    若未安装则回退到简单固定长度切分。
+
+    Args:
+        documents: 清洗后的文档列表。
+        chunk_size: 每块最大字符数。
+        chunk_overlap: 块之间重叠字符数。
+
+    Returns:
+        [{"content": str, "metadata": dict}, ...]
+    """
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", "。", "！", "？", "；", ". ", " ", ""],
+            length_function=len,
+            is_separator_regex=False,
+        )
+
+        chunks: list[dict[str, Any]] = []
+        for doc in documents:
+            if not doc.content.strip():
+                continue
+            split_texts = splitter.split_text(doc.content)
+            for i, chunk_text in enumerate(split_texts):
+                stripped = chunk_text.strip()
+                if not stripped:          # 过滤空字符串，百炼兼容接口不接受空内容
+                    continue
+                chunks.append({
+                    "content": stripped,
+                    "metadata": {
+                        **doc.metadata,
+                        "source": doc.source_path,
+                        "chunk_index": i,
+                        "chunk_total": len(split_texts),
+                    },
+                })
+        return chunks
+
+    except ImportError:
+        warnings.warn(
+            "langchain_text_splitters 未安装, 使用简单固定长度切分。"
+            "建议: pip install langchain-text-splitters",
+            RuntimeWarning,
+        )
+        return _simple_chunk(documents, chunk_size, chunk_overlap)
+
+
+def _simple_chunk(
+    documents: list[CleanedDocument],
+    chunk_size: int,
+    chunk_overlap: int,
+) -> list[dict[str, Any]]:
+    """简单固定长度切分 (不含 LangChain)。"""
+    chunks: list[dict[str, Any]] = []
+    for doc in documents:
+        text = doc.content
+        if not text.strip():
+            continue
+        step = chunk_size - chunk_overlap
+        if step <= 0:
+            step = chunk_size // 2
+        total = max(1, (len(text) - chunk_overlap) // step + 1)
+        for i in range(0, len(text), step):
+            chunk_text = text[i:i + chunk_size]
+            if not chunk_text.strip():
+                continue
+            chunks.append({
+                "content": chunk_text.strip(),
+                "metadata": {
+                    **doc.metadata,
+                    "source": doc.source_path,
+                    "chunk_index": i // step,
+                    "chunk_total": total,
+                },
+            })
+    return chunks
+
+
+def to_langchain_documents(
+    chunks: list[dict[str, Any]],
+) -> list[Any]:
+    """将 chunk dict 列表转换为 LangChain Document 对象。
+
+    需要: pip install langchain-core
+
+    Args:
+        chunks: chunk_documents() 的输出。
+
+    Returns:
+        list[langchain_core.documents.Document]
+    """
+    try:
+        from langchain_core.documents import Document
+
+        return [
+            Document(page_content=c["content"], metadata=c["metadata"])
+            for c in chunks
+            if c["content"].strip()  # 二次过滤，防止空内容进入向量库
+        ]
+    except ImportError:
+        warnings.warn(
+            "langchain-core 未安装, 返回原始 dict 列表。"
+            "建议: pip install langchain-core",
+            RuntimeWarning,
+        )
+        return chunks
+
+
+# --------------------------------------------------------
+# 主流水线
+# --------------------------------------------------------
+
+
+def clean_text(text: str, config: CleanConfig | None = None) -> str:
+    """对单篇文档文本执行完整清洗流水线。
+
+    Args:
+        text: 原始 MDX 文本。
+        config: 清洗配置, 为 None 则使用默认值。
+
+    Returns:
+        清洗后的纯文本。
+    """
+    if config is None:
+        config = CleanConfig()
+
+    # Step 1: 移除翻译声明
+    if config.remove_translation_notice:
+        text = remove_translation_notice(text)
+
+    # Step 2: 剥离 MDX 组件标签
+    text = strip_mdx_tags(text)
+
+    # Step 3: 剥离 HTML 标签
+    text = strip_html_tags(text)
+
+    # Step 4: 清理 Markdown 标记
+    text = clean_markdown(text, keep_headers=config.keep_headers)
+
+    # Step 5: 规范化空白
+    text = normalize_whitespace(
+        text,
+        min_line_length=config.min_line_length,
+        max_consecutive_newlines=config.max_consecutive_newlines,
+    )
+
+    # Step 6: 中文标点规范化
+    text = normalize_chinese_punctuation(text)
+
+    return text.strip()
+
+
+def clean_file(file_path: str | Path, config: CleanConfig | None = None) -> CleanedDocument:
+    """读取并清洗单个文件。
+
+    Args:
+        file_path: 文件路径。
+        config: 清洗配置。
+
+    Returns:
+        CleanedDocument 对象。
+    """
+    file_path = Path(file_path)
+    raw = file_path.read_text(encoding="utf-8")
+
+    # 提取 frontmatter
+    metadata, body = extract_frontmatter(raw)
+
+    # 清洗正文
+    cleaned_body = clean_text(body, config)
+
+    # 注入文件元信息
+    metadata["file_name"] = file_path.name
+    metadata["file_stem"] = file_path.stem
+    metadata["relative_path"] = str(file_path)
+
+    if config and config.source_root:
+        try:
+            metadata["relative_path"] = str(
+                file_path.relative_to(config.source_root)
+            )
+        except ValueError:
+            pass
+
+    return CleanedDocument(
+        content=cleaned_body,
+        metadata=metadata,
+        source_path=str(file_path),
+    )
+
+
+def clean_directory(
+    root_dir: str | Path,
+    config: CleanConfig | None = None,
+) -> list[CleanedDocument]:
+    """清洗整个目录下的所有文档。
+
+    Args:
+        root_dir: 文档根目录。
+        config: 清洗配置。
+
+    Returns:
+        CleanedDocument 列表。
+    """
+    if config is None:
+        config = CleanConfig()
+
+    config.source_root = str(root_dir)
+    files = discover_files(str(root_dir), config.extensions)
+    results: list[CleanedDocument] = []
+
+    for fp in files:
+        try:
+            doc = clean_file(fp, config)
+            if doc.content.strip():
+                results.append(doc)
+        except Exception as exc:
+            warnings.warn(f"处理文件失败: {fp} —— {exc}", RuntimeWarning)
+
+    return results
+
+
+# --------------------------------------------------------
+# 便捷入口
+# --------------------------------------------------------
+
+
+def build_rag_documents(
+    docs_dir: str | Path,
+    chunk_size: int = 800,
+    chunk_overlap: int = 150,
+    as_langchain: bool = True,
+) -> list[Any]:
+    """一站式入口: 目录 → 清洗 → 分块 → LangChain Document。
+
+    Args:
+        docs_dir: Dify 中文文档根目录。
+        chunk_size: 分块大小。
+        chunk_overlap: 重叠大小。
+        as_langchain: 是否返回 LangChain Document 对象。
+
+    Returns:
+        LangChain Document 列表, 或 dict 列表。
+    """
+    config = CleanConfig(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+    print(f"发现 {len(discover_files(str(docs_dir)))} 个文件")
+    documents = clean_directory(docs_dir, config)
+    print(f"成功清洗 {len(documents)} 篇文档")
+
+    chunks = chunk_documents(documents, chunk_size, chunk_overlap)
+    print(f"生成 {len(chunks)} 个文本块")
+
+    if as_langchain:
+        chunks = to_langchain_documents(chunks)
+        print(f"输出 {len(chunks)} 个 LangChain Document")
+
+    return chunks
+
+
+# --------------------------------------------------------
+# CLI
+# --------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("用法: python text_cleaner.py <docs_dir> [--json out.json] [--dry]")
+        sys.exit(1)
+
+    docs_dir = sys.argv[1]
+    out_json = None
+    dry_run = False
+
+    for arg in sys.argv[2:]:
+        if arg == "--dry":
+            dry_run = True
+        elif arg.startswith("--json") and "=" in arg:
+            out_json = arg.split("=", 1)[1]
+        elif arg == "--json" or arg == "-o":
+            idx = sys.argv.index(arg)
+            if idx + 1 < len(sys.argv):
+                out_json = sys.argv[idx + 1]
+
+    chunks = build_rag_documents(docs_dir, as_langchain=False)
+
+    if dry_run:
+        # 打印前 3 条样本
+        for i, c in enumerate(chunks[:3]):
+            print(f"\n{'='*60}")
+            print(f"Chunk #{i} | source: {c['metadata'].get('source', '?')}")
+            print(f"{'='*60}")
+            print(c["content"][:500])
+
+    if out_json:
+        out_path = Path(out_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(chunks, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        print(f"\n已输出至: {out_json}")

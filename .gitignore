@@ -1,0 +1,15 @@
+# 环境变量 (包含 API 密钥)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Chroma 向量库 (可重建)
+chroma_db/
+
+# IDE
+.idea/
+.vscode/
