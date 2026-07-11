@@ -19,6 +19,9 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8.0",
 ]
+eval = [
+    "ragas>=0.2.0",
+]
 
 [tool.setuptools]
 py-modules = ["text_cleaner", "main"]

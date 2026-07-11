@@ -6,6 +6,9 @@ Dify RAG Agent
 用法:
   python main.py                          # 交互问答 (自动建索引)
   python main.py "什么是 Dify Agent?"     # 单次问答
+  python main.py --eval                   # 运行完整 RAG 评估
+  python main.py --eval --eval-mode retrieval  # 仅检索评估
+  python main.py --eval --eval-output report.json  # 保存评估报告
 
 配置:
   所有环境变量统一在 .env 文件中管理。
@@ -42,6 +45,8 @@ except ImportError:
     HAS_CHROMA = False
 
 from text_cleaner import build_rag_documents
+from eval_dataset import get_default_dataset, load_dataset_from_json, dataset_summary
+from eval_rag import run_evaluation, save_report, EvalReport, RAGAS_AVAILABLE
 
 # ---------------------------------------------------------------------------
 # 配置 (从 .env / 环境变量读取)
@@ -231,6 +236,137 @@ def _check_config():
 
 
 # ---------------------------------------------------------------------------
+# 检索与生成 (可复用的核心函数, 供 ask() 和 eval 使用)
+# ---------------------------------------------------------------------------
+
+
+def retrieve_docs(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K):
+    """检索 top-k 相关文档片段 (纯检索, 不生成)。
+
+    Args:
+        question: 用户问题。
+        persist_dir: Chroma 持久化目录。
+        top_k: 返回结果数量。
+
+    Returns:
+        LangChain Document 列表。
+    """
+    if not HAS_CHROMA:
+        raise RuntimeError("请安装 langchain-chroma chromadb: pip install langchain-chroma chromadb")
+
+    vectorstore = _get_vectorstore(persist_dir)
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": top_k},
+    )
+    return retriever.invoke(question)
+
+
+def _get_llm():
+    """获取配置好的 LLM 实例 (带重试装饰)。
+
+    Returns:
+        ChatOpenAI 实例。
+    """
+    from langchain_openai import ChatOpenAI
+
+    llm_kwargs: dict = {"model": LLM_MODEL, "temperature": 0.3}
+    if LLM_BASE_URL:
+        llm_kwargs["base_url"] = LLM_BASE_URL
+    if LLM_API_KEY:
+        llm_kwargs["api_key"] = LLM_API_KEY
+    return ChatOpenAI(**llm_kwargs)
+
+
+def _build_prompt(question: str, docs) -> str:
+    """构建 RAG prompt (复用与 ask() 相同的模板)。
+
+    Args:
+        question: 用户问题。
+        docs: 检索到的 LangChain Document 列表。
+
+    Returns:
+        格式化的 prompt 字符串。
+    """
+    context = "\n\n---\n\n".join(
+        f"[来源: {d.metadata.get('source', '?')}]\n{d.page_content}"
+        for d in docs
+    )
+    return f"""你是一个 Dify 平台的专家助手。请只根据以下参考文档回答用户问题。
+如果文档中没有相关信息, 请明确告知用户。
+
+## 参考文档
+
+{context}
+
+## 用户问题
+
+{question}
+
+## 回答要求
+
+- 使用中文回答。
+- 引用文档中的具体信息。
+- 如果信息不足, 如实说明。
+- 回答结构清晰, 可使用 Markdown 格式。
+"""
+
+
+def _eval_generate(question: str, contexts: List[str], llm) -> str:
+    """评估用生成函数: 根据检索上下文生成回答。
+
+    Args:
+        question: 用户问题。
+        contexts: 检索到的上下文字符串列表 (已提取 page_content)。
+        llm: LangChain LLM 实例。
+
+    Returns:
+        生成的回答文本。
+    """
+    context_text = "\n\n---\n\n".join(contexts)
+    prompt = f"""你是一个 Dify 平台的专家助手。请只根据以下参考文档回答用户问题。
+如果文档中没有相关信息, 请明确告知用户。
+
+## 参考文档
+
+{context_text}
+
+## 用户问题
+
+{question}
+
+## 回答要求
+
+- 使用中文回答。
+- 引用文档中的具体信息。
+- 如果信息不足, 如实说明。
+- 回答结构清晰, 可使用 Markdown 格式。
+"""
+    response = llm.invoke(prompt)
+    return response.content if hasattr(response, "content") else str(response)
+
+
+def _retrieve_fn_for_eval(question: str, k: int = TOP_K):
+    """适配 eval_rag 检索接口: 返回带 source/page_content 的 dict 列表。
+
+    Args:
+        question: 用户问题。
+        k: Top-K 参数。
+
+    Returns:
+        [{"source": str, "page_content": str}, ...]
+    """
+    docs = retrieve_docs(question, top_k=k)
+    return [
+        {
+            "source": d.metadata.get("source", ""),
+            "page_content": d.page_content,
+        }
+        for d in docs
+    ]
+
+
+# ---------------------------------------------------------------------------
 # 步骤 1: 构建向量索引 (自动)
 # ---------------------------------------------------------------------------
 
@@ -292,56 +428,26 @@ def ensure_index(docs_dir: str = DIFY_DOCS_DIR, persist_dir: str = CHROMA_PERSIS
 # 步骤 2: 检索问答
 # ---------------------------------------------------------------------------
 
-def ask(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K):
-    """检索并回答单个问题。"""
+def ask(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K, *, _return_data: bool = False):
+    """检索并回答单个问题。
+
+    Args:
+        question: 用户问题。
+        persist_dir: Chroma 持久化目录。
+        top_k: 检索数量。
+        _return_data: 内部使用 — 为 True 时返回 (answer, docs) 元组, 不打印。
+    """
     if not HAS_CHROMA:
         raise RuntimeError("请安装 langchain-chroma chromadb: pip install langchain-chroma chromadb")
 
-    from langchain_openai import ChatOpenAI
-
-    # 复用缓存的向量库，避免每次从磁盘重新加载
-    vectorstore = _get_vectorstore(persist_dir)
-
     # 检索
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": top_k},
-    )
-    docs = retriever.invoke(question)
+    docs = retrieve_docs(question, persist_dir=persist_dir, top_k=top_k)
 
-    # 构建上下文
-    context = "\n\n---\n\n".join(
-        f"[来源: {d.metadata.get('source', '?')}]\n{d.page_content}"
-        for d in docs
-    )
+    # 构建 prompt
+    prompt = _build_prompt(question, docs)
 
     # 调用 LLM（带重试）
-    llm_kwargs: dict = {"model": LLM_MODEL, "temperature": 0.3}
-    if LLM_BASE_URL:
-        llm_kwargs["base_url"] = LLM_BASE_URL
-    if LLM_API_KEY:
-        llm_kwargs["api_key"] = LLM_API_KEY
-    llm = ChatOpenAI(**llm_kwargs)
-
-    prompt = f"""你是一个 Dify 平台的专家助手。请只根据以下参考文档回答用户问题。
-如果文档中没有相关信息, 请明确告知用户。
-
-## 参考文档
-
-{context}
-
-## 用户问题
-
-{question}
-
-## 回答要求
-
-- 使用中文回答。
-- 引用文档中的具体信息。
-- 如果信息不足, 如实说明。
-- 回答结构清晰, 可使用 Markdown 格式。
-"""
-
+    llm = _get_llm()
     max_retries = 3
     retry_delay = 1.0
     last_error = None
@@ -356,11 +462,16 @@ def ask(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K
     else:
         raise RuntimeError(f"LLM 调用失败（已重试 {max_retries} 次）: {last_error}")
 
+    answer = response.content if hasattr(response, "content") else str(response)
+
+    if _return_data:
+        return (answer, docs)
+
     print("\n" + "=" * 60)
     print(f"🔍 问题: {question}")
     print(f"📚 检索到 {len(docs)} 个相关片段")
     print("=" * 60)
-    print(f"\n💬 回答:\n{response.content}")
+    print(f"\n💬 回答:\n{answer}")
     print("\n" + "-" * 60)
     print("📌 参考来源:")
     for i, d in enumerate(docs, 1):
@@ -372,11 +483,112 @@ def ask(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K
 
 
 # ---------------------------------------------------------------------------
+# 评估 CLI 辅助
+# ---------------------------------------------------------------------------
+
+
+def _parse_eval_args(argv: list) -> dict | None:
+    """从命令行参数中解析 --eval 相关参数。
+
+    返回 None 表示不是 eval 模式; 返回 dict 表示 eval 配置。
+    """
+    if "--eval" not in argv:
+        return None
+
+    args = {
+        "mode": "all",
+        "output": None,
+        "dataset": None,
+        "top_k": TOP_K,
+    }
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--eval-mode" and i + 1 < len(argv):
+            args["mode"] = argv[i + 1]
+            i += 2
+        elif arg == "--eval-output" and i + 1 < len(argv):
+            args["output"] = argv[i + 1]
+            i += 2
+        elif arg == "--eval-dataset" and i + 1 < len(argv):
+            args["dataset"] = argv[i + 1]
+            i += 2
+        elif arg == "--eval-top-k" and i + 1 < len(argv):
+            args["top_k"] = int(argv[i + 1])
+            i += 2
+        elif arg == "--eval":
+            i += 1
+        else:
+            i += 1
+
+    return args
+
+
+def _run_eval_cli(eval_args: dict) -> None:
+    """执行评估并输出结果。"""
+    # 加载数据集
+    if eval_args["dataset"]:
+        dataset = load_dataset_from_json(eval_args["dataset"])
+        print(f"📂 从文件加载数据集: {eval_args['dataset']}")
+    else:
+        dataset = get_default_dataset()
+        print("📦 使用内置默认数据集")
+
+    print(dataset_summary(dataset))
+
+    # 确保向量库就绪
+    ensure_index()
+
+    # 获取 LLM 和 Embeddings
+    llm = _get_llm()
+    embeddings = DashScopeEmbeddings()
+
+    # 运行评估
+    mode = eval_args["mode"]
+    if mode == "ragas" and not RAGAS_AVAILABLE:
+        print("\n⚠️ RAGAS 未安装, 将仅运行检索评估。")
+        print("   安装 RAGAS: pip install ragas")
+        mode = "retrieval"
+
+    report = run_evaluation(
+        dataset=dataset,
+        mode=mode,
+        llm=llm,
+        embeddings=embeddings,
+        retrieve_fn=_retrieve_fn_for_eval,
+        generate_fn=lambda q, ctxs: _eval_generate(q, ctxs, llm),
+        top_k=eval_args["top_k"],
+        config={
+            "embedding_model": EMBEDDING_MODEL,
+            "llm_model": LLM_MODEL,
+            "top_k": eval_args["top_k"],
+        },
+        verbose=True,
+    )
+
+    # 打印报告
+    print(report.format_summary())
+
+    # 保存 JSON 报告
+    output_path = eval_args["output"]
+    if output_path:
+        save_report(report, output_path)
+        print(f"📄 报告已保存至: {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
 def main():
     _check_config()
+
+    # ---- 评估模式 ----
+    eval_args = _parse_eval_args(sys.argv)
+    if eval_args:
+        _run_eval_cli(eval_args)
+        return
 
     # 确保向量库就绪
     ensure_index()
