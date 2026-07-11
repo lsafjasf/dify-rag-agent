@@ -20,6 +20,11 @@ dev = [
     "ruff>=0.8.0",
 ]
 eval = []
+# BGE Reranker (需要 torch + transformers, ~2GB 模型下载)
+# 不装也能跑 —— 自动降级为 LLM 打分
+reranker = [
+    "FlagEmbedding>=1.2.0",
+]
 
 [tool.setuptools]
 py-modules = ["text_cleaner", "main"]

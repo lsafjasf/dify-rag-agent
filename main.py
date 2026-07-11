@@ -48,6 +48,8 @@ from text_cleaner import build_rag_documents
 from eval_dataset import get_default_dataset, load_dataset_from_json, dataset_summary
 from eval_rag import run_evaluation, save_report, EvalReport
 from hybrid_retriever import get_hybrid_retriever
+from hyde_generator import HyDEGenerator
+from bge_reranker import BGEReranker
 
 # ---------------------------------------------------------------------------
 # 配置 (从 .env / 环境变量读取)
@@ -72,24 +74,76 @@ LLM_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "") or os.environ.get("LLM_API_
 
 TOP_K = int(os.environ.get("TOP_K", "5"))
 
+# ---- 高级检索开关 ----
+USE_HYDE = os.environ.get("USE_HYDE", "true").lower() not in ("false", "0", "no", "off")
+USE_QE = os.environ.get("USE_QE", "true").lower() not in ("false", "0", "no", "off")
+USE_RERANKER = os.environ.get("USE_RERANKER", "true").lower() not in ("false", "0", "no", "off")
+
 
 # ---------------------------------------------------------------------------
 # 向量库缓存 —— 避免每次 ask() 都重新从磁盘加载
 # ---------------------------------------------------------------------------
 
 _vectorstore_cache: "Chroma | None" = None
+_embeddings_cache: "DashScopeEmbeddings | None" = None
+_hyde_cache: "HyDEGenerator | None" = None
+_reranker_cache: "BGEReranker | None" = None
+_llm_cache = None
+
+
+def _get_embeddings() -> "DashScopeEmbeddings":
+    """懒加载 Embeddings 实例。"""
+    global _embeddings_cache
+    if _embeddings_cache is None:
+        _embeddings_cache = DashScopeEmbeddings()
+    return _embeddings_cache
 
 
 def _get_vectorstore(persist_dir: str = CHROMA_PERSIST_DIR) -> "Chroma":
     """懒加载并缓存 Chroma 向量库，避免重复磁盘 I/O。"""
     global _vectorstore_cache
     if _vectorstore_cache is None:
-        embeddings = DashScopeEmbeddings()
+        embeddings = _get_embeddings()
         _vectorstore_cache = Chroma(
             embedding_function=embeddings,
             persist_directory=persist_dir,
         )
     return _vectorstore_cache
+
+
+def _get_hyde_gen() -> "HyDEGenerator | None":
+    """懒加载 HyDE 生成器（需要 LLM）。"""
+    global _hyde_cache
+    if not USE_HYDE:
+        return None
+    if _hyde_cache is None:
+        try:
+            _hyde_cache = HyDEGenerator(_get_llm())
+            print("✅ HyDE 生成器已就绪")
+        except Exception as exc:
+            print(f"⚠️ HyDE 生成器初始化失败: {exc}")
+            return None
+    return _hyde_cache
+
+
+def _get_reranker() -> "BGEReranker | None":
+    """懒加载 BGE Reranker。
+
+    优先级: 百炼 DashScope Rerank API → FlagEmbedding 本地 → LLM fallback
+    """
+    global _reranker_cache
+    if not USE_RERANKER:
+        return None
+    if _reranker_cache is None:
+        try:
+            _reranker_cache = BGEReranker(
+                dashscope_api_key=EMBEDDING_API_KEY,
+                llm=_get_llm(),
+            )
+        except Exception as exc:
+            print(f"⚠️ BGE Reranker 初始化失败: {exc}")
+            return None
+    return _reranker_cache
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +296,18 @@ def _check_config():
 
 
 def retrieve_docs(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K):
-    """混合检索 (BM25 + 向量 + RRF 重排) top-k 相关文档片段。
+    """HyDE 向量检索 + QE BM25 + RRF 融合 + BGE Reranker 精排。
+
+    完整流水线:
+      1. HyDE: LLM 生成假设文档 → Embedding → 向量搜索
+      2. QE:   LLM 生成 3-5 个关键词查询 → 每个 BM25 检索 → 合并去重
+      3. RRF:  Reciprocal Rank Fusion 融合两组候选
+      4. Reranker: BGE 跨编码器 / LLM 对候选精排 → Top-K
+
+    通过环境变量 USE_HYDE / USE_RERANKER 可独立开关各模块。
 
     Args:
-        question: 用户问题。
+        question: 用户问题（中文口语化）。
         persist_dir: Chroma 持久化目录。
         top_k: 返回结果数量。
 
@@ -256,16 +318,32 @@ def retrieve_docs(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: i
         raise RuntimeError("请安装 langchain-chroma chromadb: pip install langchain-chroma chromadb")
 
     vectorstore = _get_vectorstore(persist_dir)
-    hybrid = get_hybrid_retriever(vectorstore)
-    return hybrid.hybrid_search(question, top_k)
+    embeddings = _get_embeddings()
+    llm = _get_llm()
+    hyde_gen = _get_hyde_gen()
+    reranker = _get_reranker()
+
+    hybrid = get_hybrid_retriever(
+        vectorstore,
+        embeddings=embeddings,
+        llm=llm,
+        hyde_generator=hyde_gen,
+        bge_reranker=reranker,
+    )
+
+    return hybrid.hybrid_search(question, top_k, use_qe=USE_QE)
 
 
 def _get_llm():
-    """获取配置好的 LLM 实例 (带重试装饰)。
+    """获取配置好的 LLM 实例 (懒加载缓存)。
 
     Returns:
         ChatOpenAI 实例。
     """
+    global _llm_cache
+    if _llm_cache is not None:
+        return _llm_cache
+
     from langchain_openai import ChatOpenAI
 
     llm_kwargs: dict = {"model": LLM_MODEL, "temperature": 0.3}
@@ -273,7 +351,8 @@ def _get_llm():
         llm_kwargs["base_url"] = LLM_BASE_URL
     if LLM_API_KEY:
         llm_kwargs["api_key"] = LLM_API_KEY
-    return ChatOpenAI(**llm_kwargs)
+    _llm_cache = ChatOpenAI(**llm_kwargs)
+    return _llm_cache
 
 
 def _build_prompt(question: str, docs) -> str:
@@ -408,7 +487,7 @@ def ensure_index(docs_dir: str = DIFY_DOCS_DIR, persist_dir: str = CHROMA_PERSIS
     print(f"🔧 已过滤复杂 metadata (ChromaDB 兼容)")
 
     # 向量化 (百炼原生 API, 不走兼容层)
-    embeddings = DashScopeEmbeddings()
+    embeddings = _get_embeddings()
     print(f"🔢 Embedding 模型: {EMBEDDING_MODEL}  (百炼原生 API)")
 
     # 入库并缓存
@@ -540,7 +619,7 @@ def _run_eval_cli(eval_args: dict) -> None:
 
     # 获取 LLM 和 Embeddings
     llm = _get_llm()
-    embeddings = DashScopeEmbeddings()
+    embeddings = _get_embeddings()
 
     # 运行评估
     mode = eval_args["mode"]
