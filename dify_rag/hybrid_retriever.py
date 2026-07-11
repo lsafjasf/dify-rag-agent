@@ -214,6 +214,18 @@ class HybridRetriever:
         import json
         import re
 
+        # 检查缓存
+        try:
+            from dify_rag.cache import get_cache
+            cache = get_cache()
+            cached = cache.get("qe", question)
+            if cached is not None:
+                queries = json.loads(cached)
+                if isinstance(queries, list) and len(queries) > 0:
+                    return queries
+        except Exception:
+            pass
+
         prompt = self._EXPANSION_PROMPT.format(question=question)
 
         try:
@@ -255,7 +267,16 @@ class HybridRetriever:
                 if q and q not in seen:
                     seen.add(q)
                     unique.append(q)
-            return unique[:5]  # 原问题 + 最多 4 个扩展
+            result = unique[:5]  # 原问题 + 最多 4 个扩展
+
+            # 写入缓存
+            try:
+                from dify_rag.cache import get_cache
+                get_cache().set("qe", question, json.dumps(result, ensure_ascii=False))
+            except Exception:
+                pass
+
+            return result
 
         except Exception:
             return [question]

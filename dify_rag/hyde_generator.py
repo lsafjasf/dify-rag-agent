@@ -73,6 +73,16 @@ class HyDEGenerator:
         """
         import time
 
+        # 检查缓存
+        try:
+            from dify_rag.cache import get_cache
+            cache = get_cache()
+            cached = cache.get("hyde", question)
+            if cached is not None:
+                return cached
+        except Exception:
+            pass
+
         prompt = self.prompt_template.format(question=question)
 
         last_error = None
@@ -100,6 +110,12 @@ class HyDEGenerator:
                     text = m.group(1).strip()
 
                 if len(text) >= 20:  # 合理的长度下限
+                    # 写入缓存
+                    try:
+                        from dify_rag.cache import get_cache
+                        get_cache().set("hyde", question, text)
+                    except Exception:
+                        pass
                     return text
 
                 # 太短，可能有问题
