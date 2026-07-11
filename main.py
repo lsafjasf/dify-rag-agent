@@ -68,6 +68,25 @@ TOP_K = int(os.environ.get("TOP_K", "5"))
 
 
 # ---------------------------------------------------------------------------
+# 向量库缓存 —— 避免每次 ask() 都重新从磁盘加载
+# ---------------------------------------------------------------------------
+
+_vectorstore_cache: "Chroma | None" = None
+
+
+def _get_vectorstore(persist_dir: str = CHROMA_PERSIST_DIR) -> "Chroma":
+    """懒加载并缓存 Chroma 向量库，避免重复磁盘 I/O。"""
+    global _vectorstore_cache
+    if _vectorstore_cache is None:
+        embeddings = DashScopeEmbeddings()
+        _vectorstore_cache = Chroma(
+            embedding_function=embeddings,
+            persist_directory=persist_dir,
+        )
+    return _vectorstore_cache
+
+
+# ---------------------------------------------------------------------------
 # 自定义 Embedding —— 直连百炼原生 API, 绕过兼容层
 # ---------------------------------------------------------------------------
 
@@ -117,11 +136,25 @@ class DashScopeEmbeddings(BaseModel):
                     # 按 text_index 排序，保证顺序
                     embeddings.sort(key=lambda e: e.get("text_index", 0))
                     return [e["embedding"] for e in embeddings]
+                elif resp.status_code == 401:
+                    # 认证失败，重试无意义，立即抛出
+                    raise RuntimeError(
+                        f"百炼 API 认证失败（401），请检查 DASHSCOPE_API_KEY 是否正确: "
+                        f"{resp.text[:300]}"
+                    )
                 elif resp.status_code == 429:
                     time.sleep(self.retry_delay * (attempt + 1))
                     continue
-                else:
+                elif resp.status_code >= 500:
+                    # 服务端错误，可重试
                     last_error = resp.text
+                    time.sleep(self.retry_delay * (attempt + 1))
+                    continue
+                else:
+                    # 其他客户端错误（4xx），不重试
+                    raise RuntimeError(
+                        f"百炼 Embedding API 返回 {resp.status_code}: {resp.text[:300]}"
+                    )
             except requests.RequestException as e:
                 last_error = str(e)
                 time.sleep(self.retry_delay * (attempt + 1))
@@ -217,8 +250,11 @@ def _collection_has_data(persist_dir: str) -> bool:
 
 def ensure_index(docs_dir: str = DIFY_DOCS_DIR, persist_dir: str = CHROMA_PERSIST_DIR):
     """确保向量库存在, 不存在则自动清洗 + 向量化。"""
+    global _vectorstore_cache
+
     if Path(persist_dir).exists() and _collection_has_data(persist_dir):
         print(f"✅ 向量库已存在且包含数据: {persist_dir}")
+        _get_vectorstore(persist_dir)  # 预热缓存
         return
 
     if not HAS_CHROMA:
@@ -241,14 +277,14 @@ def ensure_index(docs_dir: str = DIFY_DOCS_DIR, persist_dir: str = CHROMA_PERSIS
     embeddings = DashScopeEmbeddings()
     print(f"🔢 Embedding 模型: {EMBEDDING_MODEL}  (百炼原生 API)")
 
-    # 入库
-    vectorstore = Chroma.from_documents(
+    # 入库并缓存
+    _vectorstore_cache = Chroma.from_documents(
         documents=documents,
         embedding=embeddings,
         persist_directory=persist_dir,
     )
     print(f"💾 向量库已持久化至: {persist_dir}")
-    print(f"📊 共 {vectorstore._collection.count()} 条记录")
+    print(f"📊 共 {_vectorstore_cache._collection.count()} 条记录")
     print()
 
 
@@ -263,12 +299,8 @@ def ask(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K
 
     from langchain_openai import ChatOpenAI
 
-    # 加载向量库
-    embeddings = DashScopeEmbeddings()
-    vectorstore = Chroma(
-        embedding_function=embeddings,
-        persist_directory=persist_dir,
-    )
+    # 复用缓存的向量库，避免每次从磁盘重新加载
+    vectorstore = _get_vectorstore(persist_dir)
 
     # 检索
     retriever = vectorstore.as_retriever(
@@ -283,7 +315,7 @@ def ask(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K
         for d in docs
     )
 
-    # 调用 LLM
+    # 调用 LLM（带重试）
     llm_kwargs: dict = {"model": LLM_MODEL, "temperature": 0.3}
     if LLM_BASE_URL:
         llm_kwargs["base_url"] = LLM_BASE_URL
@@ -310,7 +342,19 @@ def ask(question: str, persist_dir: str = CHROMA_PERSIST_DIR, top_k: int = TOP_K
 - 回答结构清晰, 可使用 Markdown 格式。
 """
 
-    response = llm.invoke(prompt)
+    max_retries = 3
+    retry_delay = 1.0
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = llm.invoke(prompt)
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
+    else:
+        raise RuntimeError(f"LLM 调用失败（已重试 {max_retries} 次）: {last_error}")
 
     print("\n" + "=" * 60)
     print(f"🔍 问题: {question}")

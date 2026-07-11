@@ -384,10 +384,7 @@ def chunk_documents(
     chunk_size: int = 800,
     chunk_overlap: int = 150,
 ) -> list[dict[str, Any]]:
-    """使用递归字符分割器将文档切分为 RAG 友好的块。
-
-    优先使用 LangChain 的 RecursiveCharacterTextSplitter,
-    若未安装则回退到简单固定长度切分。
+    """使用 LangChain RecursiveCharacterTextSplitter 切分文档。
 
     Args:
         documents: 清洗后的文档列表。
@@ -397,72 +394,31 @@ def chunk_documents(
     Returns:
         [{"content": str, "metadata": dict}, ...]
     """
-    try:
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", "。", "！", "？", "；", ". ", " ", ""],
-            length_function=len,
-            is_separator_regex=False,
-        )
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", "。", "！", "？", "；", ". ", " ", ""],
+        length_function=len,
+        is_separator_regex=False,
+    )
 
-        chunks: list[dict[str, Any]] = []
-        for doc in documents:
-            if not doc.content.strip():
-                continue
-            split_texts = splitter.split_text(doc.content)
-            for i, chunk_text in enumerate(split_texts):
-                stripped = chunk_text.strip()
-                if not stripped:          # 过滤空字符串，百炼兼容接口不接受空内容
-                    continue
-                chunks.append({
-                    "content": stripped,
-                    "metadata": {
-                        **doc.metadata,
-                        "source": doc.source_path,
-                        "chunk_index": i,
-                        "chunk_total": len(split_texts),
-                    },
-                })
-        return chunks
-
-    except ImportError:
-        warnings.warn(
-            "langchain_text_splitters 未安装, 使用简单固定长度切分。"
-            "建议: pip install langchain-text-splitters",
-            RuntimeWarning,
-        )
-        return _simple_chunk(documents, chunk_size, chunk_overlap)
-
-
-def _simple_chunk(
-    documents: list[CleanedDocument],
-    chunk_size: int,
-    chunk_overlap: int,
-) -> list[dict[str, Any]]:
-    """简单固定长度切分 (不含 LangChain)。"""
     chunks: list[dict[str, Any]] = []
     for doc in documents:
-        text = doc.content
-        if not text.strip():
+        if not doc.content.strip():
             continue
-        step = chunk_size - chunk_overlap
-        if step <= 0:
-            step = chunk_size // 2
-        total = max(1, (len(text) - chunk_overlap) // step + 1)
-        for i in range(0, len(text), step):
-            chunk_text = text[i:i + chunk_size]
-            if not chunk_text.strip():
-                continue
+        split_texts = splitter.split_text(doc.content)
+        # 先过滤空字符串（百炼 API 不接受空内容），再计算准确的 chunk_total
+        valid_texts = [t.strip() for t in split_texts if t.strip()]
+        for i, chunk_text in enumerate(valid_texts):
             chunks.append({
-                "content": chunk_text.strip(),
+                "content": chunk_text,
                 "metadata": {
                     **doc.metadata,
                     "source": doc.source_path,
-                    "chunk_index": i // step,
-                    "chunk_total": total,
+                    "chunk_index": i,
+                    "chunk_total": len(valid_texts),
                 },
             })
     return chunks
