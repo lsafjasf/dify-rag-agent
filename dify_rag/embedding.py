@@ -51,8 +51,10 @@ class DashScopeEmbeddings(BaseModel):
         payload = {
             "model": self.model,
             "input": {"texts": texts},
-            "parameters": {"text_type": text_type},
         }
+        # text-embedding-v4 是不对称模型，必须区分 query/document
+        if "v4" in self.model:
+            payload["parameters"] = {"text_type": text_type}
 
         last_error = None
         for attempt in range(self.max_retries):
