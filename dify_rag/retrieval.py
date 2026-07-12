@@ -27,8 +27,8 @@ _reranker_cache = None
 def _get_embeddings():
     global _embeddings_cache
     if _embeddings_cache is None:
-        from dify_rag.embedding import DashScopeEmbeddings
-        _embeddings_cache = DashScopeEmbeddings()
+        from dify_rag.embedding import DashScopeEmbeddings, CachedEmbeddings
+        _embeddings_cache = CachedEmbeddings(DashScopeEmbeddings())
     return _embeddings_cache
 
 

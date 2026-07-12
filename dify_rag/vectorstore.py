@@ -13,9 +13,9 @@ _vectorstore_cache = None
 
 def _get_embeddings():
     """懒加载 Embeddings 实例 (延迟导入避免循环引用)。"""
-    from dify_rag.embedding import DashScopeEmbeddings
+    from dify_rag.embedding import DashScopeEmbeddings, CachedEmbeddings
 
-    return DashScopeEmbeddings()
+    return CachedEmbeddings(DashScopeEmbeddings())
 
 
 def get_vectorstore(persist_dir: str = CHROMA_PERSIST_DIR):

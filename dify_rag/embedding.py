@@ -7,6 +7,7 @@ from __future__ import annotations
 import time
 from typing import List
 
+import Optional
 import requests
 from pydantic import BaseModel, Field
 
@@ -104,3 +105,69 @@ class DashScopeEmbeddings(BaseModel):
         if results:
             return results[0]
         raise RuntimeError("Embedding 返回为空")
+
+
+class CachedEmbeddings:
+    """带 SQLite 缓存的 Embeddings 包装器。
+
+    透明拦截 embed_query / embed_documents, 优先从 EmbeddingCache 读取。
+    缓存 key 包含模型名, 切换模型自动失效。
+
+    用法:
+      embeddings = CachedEmbeddings(DashScopeEmbeddings(), cache_dir="./cache")
+      vec = embeddings.embed_query("如何创建知识库?")   # 首次 → API, 后续 → 缓存
+    """
+
+    def __init__(self, backend: DashScopeEmbeddings, cache_dir: str = "./cache"):
+        from dify_rag.cache import get_embedding_cache
+
+        self._backend = backend
+        self._cache = get_embedding_cache(cache_dir)
+
+    @property
+    def model(self) -> str:
+        return self._backend.model
+
+    def embed_query(self, text: str) -> List[float]:
+        """单条 embedding (带缓存)。"""
+        if not text.strip():
+            raise RuntimeError("Embedding 输入为空")
+
+        cached = self._cache.get(self.model, text)
+        if cached is not None:
+            return cached
+
+        result = self._backend.embed_query(text)
+        self._cache.set(self.model, text, result)
+        return result
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """批量 embedding (带缓存) — 逐条检查, 未命中分批调用 API。
+
+        v1/v3/v4 均有 batch_size ≤ 10 的限制, 已缓存部分跳过, 未命中部分
+        按 10 条一批调用后端 API。对于 60 条固定测试集, 第二次评估全命中。
+        """
+        result: List[Optional[List[float]]] = [None] * len(texts)
+        uncached: List[tuple[int, str]] = []
+
+        for i, t in enumerate(texts):
+            if not t.strip():
+                continue
+            cached = self._cache.get(self.model, t)
+            if cached is not None:
+                result[i] = cached
+            else:
+                uncached.append((i, t))
+
+        if uncached:
+            batch_size = 10
+            for start in range(0, len(uncached), batch_size):
+                batch = uncached[start : start + batch_size]
+                idxs, batch_texts = zip(*batch)
+                fresh = self._backend._call_api(list(batch_texts), text_type="document")
+                for j, idx in enumerate(idxs):
+                    vec = fresh[j] if j < len(fresh) else []
+                    result[idx] = vec
+                    self._cache.set(self.model, batch_texts[j], vec)
+
+        return [r if r is not None else [] for r in result]

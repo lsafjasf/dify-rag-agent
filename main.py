@@ -64,7 +64,7 @@ def _run_eval_cli(eval_args: dict) -> None:
     """执行评估并输出结果。"""
     from dify_rag.config import EMBEDDING_MODEL, LLM_MODEL
     from dify_rag.llm import get_llm
-    from dify_rag.embedding import DashScopeEmbeddings
+    from dify_rag.embedding import DashScopeEmbeddings, CachedEmbeddings
     from dify_rag.eval.engine import run_evaluation, save_report
     from dify_rag.eval.dataset import get_default_dataset, load_dataset_from_json, dataset_summary
     from dify_rag.retrieval import _retrieve_fn_for_eval
@@ -85,7 +85,7 @@ def _run_eval_cli(eval_args: dict) -> None:
 
     # 获取 LLM 和 Embeddings
     llm = get_llm()
-    embeddings = DashScopeEmbeddings()
+    embeddings = CachedEmbeddings(DashScopeEmbeddings())
 
     # 运行评估
     mode = eval_args["mode"]
