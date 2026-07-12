@@ -83,19 +83,31 @@ _REF_QUERY_PATTERNS = [
     "支持哪些", "有哪些功能", "有什么功能", "有什么区别", "有什么不同",
     "有哪些类型", "支持什么", "限制", "版本控制", "参数", "配置选项",
     "是什么", "做什么", "有什么用", "用途", "功能包括",
+    "排查", "什么问题", "检查什么",
+    "需要哪些", "前置条件", "系统要求",
 ]
 
 # 操作指南类查询 —— 用户想了解"怎么做"
 _HOWTO_QUERY_PATTERNS = [
     "怎么用", "如何使用", "如何配置", "如何设置", "怎么配置",
     "怎么设置", "如何创建", "如何安装", "如何部署",
+    "如何在", "如何管理", "如何通过", "如何将", "如何为",
+    "如何从", "导入", "接入",
 ]
 
 
 def _analyze_query_intent(question: str) -> str:
-    """分析查询意图: reference / howto / neutral。"""
+    """分析查询意图: reference / howto / mixed / neutral。
+
+    - reference: 仅匹配技术参考类模式
+    - howto: 仅匹配操作指南类模式
+    - mixed: 同时匹配两类模式 (如 "支持哪些类型？如何安装？")
+    - neutral: 都不匹配
+    """
     ref_score = sum(1 for p in _REF_QUERY_PATTERNS if p in question)
     howto_score = sum(1 for p in _HOWTO_QUERY_PATTERNS if p in question)
+    if ref_score > 0 and howto_score > 0:
+        return "mixed"
     if ref_score > howto_score:
         return "reference"
     elif howto_score > ref_score:
@@ -220,11 +232,12 @@ def retrieve_docs(
         bge_reranker=reranker,
     )
 
-    docs = hybrid.hybrid_search(question, top_k, use_qe=USE_QE)
+    # Phase 3: 分析查询意图, 触发元数据预过滤检索
+    intent = _analyze_query_intent(question)
+    docs = hybrid.hybrid_search(question, top_k, use_qe=USE_QE, intent=intent)
 
-    # Phase 3: 对技术参考类查询提升参考文档排名
+    # Phase 3: 后置 boost (作为预过滤的补充安全网)
     docs = _boost_reference_docs(question, docs, top_k)
-    # Phase 3: 对操作指南类查询提升 guide/tutorial 文档排名
     docs = _boost_guide_docs(question, docs, top_k)
 
     return docs

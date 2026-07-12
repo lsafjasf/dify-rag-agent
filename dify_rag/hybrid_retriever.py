@@ -305,21 +305,28 @@ class HybridRetriever:
 
     # ---- HyDE Vector Search ----
 
-    def _hyde_search(self, query: str, top_k: int) -> List:
+    def _hyde_search(
+        self, query: str, top_k: int, doc_category_filter: str | None = None
+    ) -> List:
         """HyDE 向量检索：生成假设文档 → Embedding → 向量搜索。
 
         Args:
             query: 用户原始问题。
             top_k: 返回数量。
+            doc_category_filter: 可选, 按 doc_category 元数据过滤
+                (如 "reference" / "guide" / "tutorial")。
 
         Returns:
             LangChain Document 列表。
         """
         if self._hyde_gen is None or self._embeddings is None:
             # 降级：使用原始 query 进行向量检索
+            kwargs = {"k": top_k}
+            if doc_category_filter:
+                kwargs["filter"] = {"doc_category": doc_category_filter}
             retriever = self.vectorstore.as_retriever(
                 search_type="similarity",
-                search_kwargs={"k": top_k},
+                search_kwargs=kwargs,
             )
             return retriever.invoke(query)
 
@@ -330,15 +337,22 @@ class HybridRetriever:
             # 2) 嵌入假设文档
             hyde_embedding = self._embeddings.embed_query(hyde_text)
 
-            # 3) 向量相似度搜索
+            # 3) 向量相似度搜索 (可选元数据预过滤)
+            filter_kwargs: dict = {}
+            if doc_category_filter:
+                filter_kwargs["filter"] = {"doc_category": doc_category_filter}
+
             return self.vectorstore.similarity_search_by_vector(
-                hyde_embedding, k=top_k
+                hyde_embedding, k=top_k, **filter_kwargs
             )
         except Exception as exc:
             print(f"  ⚠️ HyDE 检索失败 ({exc})，降级使用原始查询")
+            kwargs = {"k": top_k}
+            if doc_category_filter:
+                kwargs["filter"] = {"doc_category": doc_category_filter}
             retriever = self.vectorstore.as_retriever(
                 search_type="similarity",
-                search_kwargs={"k": top_k},
+                search_kwargs=kwargs,
             )
             return retriever.invoke(query)
 
@@ -452,29 +466,88 @@ class HybridRetriever:
 
     # ---- 主检索入口 ----
 
-    def hybrid_search(self, query: str, top_k: int = 5, *, use_qe: bool = True) -> List:
+    def hybrid_search(
+        self, query: str, top_k: int = 5, *, use_qe: bool = True,
+        intent: str = "neutral",
+    ) -> List:
         """执行完整混合检索流水线。
 
         流水线:
-          1. HyDE 向量检索 (parallel with step 2 conceptually)
-          2. Query Expansion → BM25 多路检索
-          3. RRF 融合
-          4. BGE Reranker 重排序
-          5. 返回 Top-K
+          1. HyDE 向量检索
+          2. Intent-based 元数据预过滤向量检索 (确保目标类别文档进入 RRF)
+          3. Query Expansion → BM25 多路检索
+          4. RRF 融合
+          5. BGE Reranker 重排序
+          6. 返回 Top-K
 
         Args:
             query: 用户问题（中文口语化）。
             top_k: 最终返回数量。
             use_qe: 是否启用 Query Expansion（LLM 改写多关键词查询）。
+            intent: 查询意图 ("reference" | "howto" | "neutral")，
+                    用于触发元数据预过滤。
 
         Returns:
             LangChain Document 列表。
         """
-        # ── Step 1: HyDE 向量检索 ──
-        # 扩大候选池: top_k*8, 上限 60, 确保更多相关文档进入后续 RRF 融合
+        # ── Step 1: HyDE 向量检索 (无过滤) ──
         vector_candidates = self._hyde_search(
             query, top_k=max(top_k * 8, 60)
         )
+
+        # ── Step 1.5: 类别均衡注入 ──
+        # 核心改进: 检查 unfiltered 检索结果是否存在类别严重失衡
+        # (如 top-10 中 reference 文档为 0), 失衡时才从缺失类别补入少量文档。
+        # 不做硬注入避免挤掉正确答案 —— 很多"如何做"的答案在参考文档而非教程中。
+        if intent != "neutral":
+            # 统计 unfiltered top-N 中各 doc_category 的占比
+            top_n = max(top_k * 2, 10)
+            cat_counts: dict = {}
+            for d in vector_candidates[:top_n]:
+                cat = d.metadata.get("doc_category", "")
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+
+            ref_count = cat_counts.get("reference", 0)
+            guide_count = cat_counts.get("guide", 0) + cat_counts.get("tutorial", 0)
+
+            filtered_extra: List = []
+            # reference 文档缺失 (top-N 中为 0) → 补入少量参考文档
+            if ref_count == 0:
+                try:
+                    filtered_extra = self._hyde_search(
+                        query, top_k=max(top_k, 5),
+                        doc_category_filter="reference",
+                    )
+                except Exception:
+                    pass
+            # guide/tutorial 文档缺失 → 补入少量指南/教程
+            if guide_count == 0:
+                try:
+                    guide = self._hyde_search(
+                        query, top_k=max(top_k, 5),
+                        doc_category_filter="guide",
+                    )
+                    tutorial = self._hyde_search(
+                        query, top_k=max(top_k, 5),
+                        doc_category_filter="tutorial",
+                    )
+                    seen: set = {self._doc_key(d) for d in filtered_extra}
+                    for d in guide + tutorial:
+                        key = self._doc_key(d)
+                        if key not in seen:
+                            seen.add(key)
+                            filtered_extra.append(d)
+                except Exception:
+                    pass
+
+            # 将补充文档追加到 vector_candidates 末尾 (获得中等 RRF 排名)
+            # —— 不抢占头部排名, 避免"教程淹没参考"或"参考淹没教程"
+            if filtered_extra:
+                extra_keys = {self._doc_key(d) for d in filtered_extra}
+                vector_candidates = (
+                    [d for d in vector_candidates if self._doc_key(d) not in extra_keys]
+                    + filtered_extra
+                )
 
         # ── Step 2: Query Expansion + BM25 ──
         if use_qe:
@@ -482,13 +555,11 @@ class HybridRetriever:
         else:
             expanded_queries = [query]  # 不做扩展，直接用原问题
 
-        # 扩大候选池: top_k*4, 上限 20 (每个扩展查询独立检索)
         bm25_candidates = self._bm25_multi_search(
             expanded_queries, top_k_per_query=max(top_k * 4, 20)
         )
 
         # ── Step 3: RRF 融合 ──
-        # 扩大候选池: top_k*10, 上限 60, 给 reranker 足够的精排空间
         if bm25_candidates:
             candidates = self._rrf_fuse(
                 vector_candidates, bm25_candidates,
