@@ -142,6 +142,45 @@ def _boost_reference_docs(
     return docs[:top_k]
 
 
+def _boost_guide_docs(
+    question: str, docs: list["Document"], top_k: int
+) -> list["Document"]:
+    """对操作指南类查询, 将 guide/tutorial 文档排名提升 1-2 位。
+
+    仅当 top-3 中没有 guide/tutorial 类文档, 且 top_k 内存在时触发。
+    将一个排名最高的 guide/tutorial 文档交换到第 2 位 (不替换第 1 位)。
+    """
+    intent = _analyze_query_intent(question)
+    if intent != "howto":
+        return docs
+    if len(docs) <= 1:
+        return docs
+
+    # 检查 top-3 中是否已有 guide/tutorial 文档
+    top_guide = any(
+        d.metadata.get("doc_category") in ("guide", "tutorial")
+        for d in docs[:3]
+    )
+    if top_guide:
+        return docs  # 已有操作指南文档, 无需调整
+
+    # 找排名最高的 guide/tutorial 文档
+    best_idx = None
+    for i, d in enumerate(docs):
+        if d.metadata.get("doc_category") in ("guide", "tutorial"):
+            best_idx = i
+            break
+
+    if best_idx is None or best_idx < 3:
+        return docs  # 没有可提升的文档, 或已在 top-3
+
+    # 将 guide/tutorial 文档提升到第 2 位 (保留第 1 位不变)
+    guide_doc = docs.pop(best_idx)
+    docs.insert(1, guide_doc)
+
+    return docs[:top_k]
+
+
 def retrieve_docs(
     question: str,
     persist_dir: str = CHROMA_PERSIST_DIR,
@@ -185,6 +224,8 @@ def retrieve_docs(
 
     # Phase 3: 对技术参考类查询提升参考文档排名
     docs = _boost_reference_docs(question, docs, top_k)
+    # Phase 3: 对操作指南类查询提升 guide/tutorial 文档排名
+    docs = _boost_guide_docs(question, docs, top_k)
 
     return docs
 

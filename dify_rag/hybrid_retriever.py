@@ -59,12 +59,34 @@ class BM25Retriever:
         self.idf = self._compute_idf()
 
     def _tokenize(self, text: str) -> List[str]:
-        """字符级 unigram + bigram 分词（中文友好）。"""
-        # 提取所有非空白字符
+        """jieba 词级分词 + 字符 bigram 兜底（中文友好）。
+
+        使用 jieba 进行词级分词，能正确识别中文复合术语
+        （如"对话变量"、"个性化体验"、"阻塞式返回"等），
+        同时保留字符 bigram 作为 OOV 和英文混合文本的兜底。
+        如果 jieba 不可用，降级为原字符级 unigram+bigram。
+        """
+        try:
+            import jieba
+            # 词级分词
+            words = list(jieba.cut(text))
+            words = [w.strip() for w in words if w.strip()]
+        except ImportError:
+            words = []
+
+        # 字符 bigram 兜底（处理 OOV 和英文混合文本）
         chars = [c for c in text if not c.isspace()]
-        tokens = list(chars)  # unigrams
+        bigrams = []
         for i in range(len(chars) - 1):
-            tokens.append(chars[i] + chars[i + 1])  # bigrams
+            bigrams.append(chars[i] + chars[i + 1])
+
+        # 词级 token + bigram，去重
+        seen = set()
+        tokens = []
+        for t in words + bigrams:
+            if t not in seen:
+                seen.add(t)
+                tokens.append(t)
         return tokens
 
     def _compute_idf(self) -> Dict[str, float]:
@@ -449,8 +471,9 @@ class HybridRetriever:
             LangChain Document 列表。
         """
         # ── Step 1: HyDE 向量检索 ──
+        # 扩大候选池: top_k*8, 上限 60, 确保更多相关文档进入后续 RRF 融合
         vector_candidates = self._hyde_search(
-            query, top_k=min(top_k * 3, 30)
+            query, top_k=max(top_k * 8, 60)
         )
 
         # ── Step 2: Query Expansion + BM25 ──
@@ -459,18 +482,20 @@ class HybridRetriever:
         else:
             expanded_queries = [query]  # 不做扩展，直接用原问题
 
+        # 扩大候选池: top_k*4, 上限 20 (每个扩展查询独立检索)
         bm25_candidates = self._bm25_multi_search(
-            expanded_queries, top_k_per_query=min(top_k * 2, 15)
+            expanded_queries, top_k_per_query=max(top_k * 4, 20)
         )
 
         # ── Step 3: RRF 融合 ──
+        # 扩大候选池: top_k*10, 上限 60, 给 reranker 足够的精排空间
         if bm25_candidates:
             candidates = self._rrf_fuse(
                 vector_candidates, bm25_candidates,
-                top_k=min(top_k * 3, 30),  # 多取一些给 reranker 用
+                top_k=max(top_k * 10, 60),
             )
         else:
-            candidates = vector_candidates[:min(top_k * 3, 30)]
+            candidates = vector_candidates[:max(top_k * 10, 60)]
 
         # ── Step 4: BGE Reranker 精排 ──
         if self._reranker is not None and self._reranker.is_available:

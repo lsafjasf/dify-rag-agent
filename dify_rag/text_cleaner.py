@@ -103,10 +103,12 @@ class CleanConfig:
     max_consecutive_newlines: int = 2
 
     # 分块大小 (字符数, 中文约 2 字符 = 1 token)
-    chunk_size: int = 800
+    # 从 800 提升到 1200, 让每个 chunk 携带更完整的上下文,
+    # 提高 embedding 质量和检索召回率。
+    chunk_size: int = 1200
 
     # 分块重叠大小
-    chunk_overlap: int = 150
+    chunk_overlap: int = 200
 
     # 文档来源根目录 (写入 metadata)
     source_root: str = ""
@@ -873,8 +875,8 @@ def clean_directory(
 
 def build_rag_documents(
     docs_dir: str | Path,
-    chunk_size: int = 800,
-    chunk_overlap: int = 150,
+    chunk_size: int = 1200,
+    chunk_overlap: int = 200,
     as_langchain: bool = True,
 ) -> list[Any]:
     """一站式入口: 目录 → 清洗 → 分块 → LangChain Document。
