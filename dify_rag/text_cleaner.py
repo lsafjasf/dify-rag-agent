@@ -45,6 +45,18 @@ MDX_SELF_CLOSING_COMPONENTS = [
     "Frame",  # <Frame /> 也是自闭合的
 ]
 
+# MDX 组件中需要保留的关键属性 —— 这些属性携带语义信息,
+# 在剥离标签之前会被提取并注入到内容中
+# 格式: 组件名 → [(属性名, 前缀)]
+MDX_SEMANTIC_ATTRS: dict[str, list[tuple[str, str]]] = {
+    "Card": [("title", "**"), ("href", "(")],   # title → **title**, href → (href)
+    "Step": [("title", "**")],                   # title → **title**
+    "Frame": [("caption", "")],                  # caption → caption
+}
+
+# href 属性的右括号 (在格式化时补充)
+_HREF_ATTRS = {"href"}
+
 # HTML 标签 —— 剥离标签, 保留内部文字
 HTML_TAGS = [
     "div", "span", "p", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -63,8 +75,10 @@ AI_TRANSLATION_PATTERN = re.compile(
 # Markdown 图片: ![alt](url)
 MD_IMAGE_PATTERN = re.compile(r"!\[.*?\]\(.*?\)")
 
-# Markdown 链接: [text](url) → 保留 text
-MD_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+# Markdown 链接: [text](url) → text (url)
+# 同时保留链接文字和 URL 路径 —— URL 中包含大量专业知识
+# (API 端点路径、参数名、层级结构等), 对 RAG 检索价值很高。
+MD_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 # --------------------------------------------------------
 # 数据结构
@@ -82,7 +96,8 @@ class CleanConfig:
     remove_translation_notice: bool = True
 
     # 最小行长度 (短于此值的行视为碎片, 会被移除)
-    min_line_length: int = 2
+    # 设为 1 以避免误删代码块中的单字符行 (如 JSON 的 { })
+    min_line_length: int = 1
 
     # 连续空行合并阈值 (超过 N 个空行合并为 1 个)
     max_consecutive_newlines: int = 2
@@ -97,7 +112,7 @@ class CleanConfig:
     source_root: str = ""
 
     # 需要处理的文件后缀
-    extensions: tuple[str, ...] = (".mdx", ".md")
+    extensions: tuple[str, ...] = (".mdx", ".md", ".json")
 
     # 是否保留代码块
     keep_code_blocks: bool = True
@@ -179,6 +194,63 @@ def extract_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 def remove_translation_notice(text: str) -> str:
     """移除 AI 翻译声明行。"""
     return AI_TRANSLATION_PATTERN.sub("", text)
+
+
+def _preserve_component_attrs(text: str) -> str:
+    """在剥离 MDX 标签之前, 提取关键属性的语义信息注入到内容中。
+
+    处理的组件及其属性:
+      Card:  title → **title**, href → (href)
+      Step:  title → **title**
+      Frame: caption → caption
+
+    例如:
+      <Card title="API 参考" href="/zh/api">内容</Card>
+      → **API 参考** (/zh/api)：内容
+
+    经过此预处理后, strip_mdx_tags 仍会剥离剩余的标签壳,
+    但关键信息已经以 Markdown 格式嵌入到了文本内容中。
+    """
+    def _replacer(match: re.Match) -> str:
+        tag_name = match.group(1)
+        inner = match.group(2).strip()
+        full_tag = match.group(0)
+
+        attr_specs = MDX_SEMANTIC_ATTRS.get(tag_name, [])
+        parts: list[str] = []
+        for attr_name, prefix in attr_specs:
+            # 匹配 attr="value" 或 attr='value'
+            m = re.search(rf'{attr_name}="([^"]*)"', full_tag)
+            if not m:
+                m = re.search(rf"{attr_name}='([^']*)'", full_tag)
+            if not m:
+                continue
+            value = m.group(1)
+            if attr_name in _HREF_ATTRS:
+                parts.append(f"{prefix}{value})")
+            elif prefix:
+                parts.append(f"{prefix}{value}{prefix}")
+            else:
+                parts.append(f"{value}")
+
+        if not parts:
+            return inner  # 没有可提取的属性, 仅返回内部文字
+
+        # 组装输出: **title** (href)：inner 或 **title**：inner 等
+        prefix_str = " ".join(parts)
+        if inner:
+            return f"{prefix_str}：{inner}"
+        return prefix_str
+
+    # 对每个有语义属性的组件类型进行替换
+    for component_name in MDX_SEMANTIC_ATTRS:
+        pattern = re.compile(
+            rf"<({component_name})(?:\s[^>]*)?>(.*?)</\1>",
+            re.DOTALL,
+        )
+        text = pattern.sub(_replacer, text)
+
+    return text
 
 
 def strip_mdx_tags(text: str) -> str:
@@ -263,8 +335,8 @@ def clean_markdown(text: str, keep_headers: bool = True) -> str:
     # 图片
     text = MD_IMAGE_PATTERN.sub("", text)
 
-    # 链接 → 保留链接文字
-    text = MD_LINK_PATTERN.sub(r"\1", text)
+    # 链接 → 保留链接文字 + URL 路径
+    text = MD_LINK_PATTERN.sub(r"\1 (\2)", text)
 
     # 粗体/斜体: **text** / *text* → text
     # 注意: 只处理 * 包裹的强调, 不用 _ 因为 _ 在技术文档中频繁出现于
@@ -299,7 +371,7 @@ def clean_markdown(text: str, keep_headers: bool = True) -> str:
 
 def normalize_whitespace(
     text: str,
-    min_line_length: int = 2,
+    min_line_length: int = 1,
     max_consecutive_newlines: int = 2,
 ) -> str:
     """规范化空白字符。
@@ -476,26 +548,133 @@ def clean_text(text: str, config: CleanConfig | None = None) -> str:
     if config.remove_translation_notice:
         text = remove_translation_notice(text)
 
-    # Step 2: 剥离 MDX 组件标签
+    # Step 2: 提取 MDX 组件关键属性 (Card title/href, Step title, Frame caption)
+    text = _preserve_component_attrs(text)
+
+    # Step 3: 剥离 MDX 组件标签
     text = strip_mdx_tags(text)
 
-    # Step 3: 剥离 HTML 标签
+    # Step 4: 剥离 HTML 标签
     text = strip_html_tags(text)
 
-    # Step 4: 清理 Markdown 标记
+    # Step 5: 清理 Markdown 标记
     text = clean_markdown(text, keep_headers=config.keep_headers)
 
-    # Step 5: 规范化空白
+    # Step 6: 规范化空白
     text = normalize_whitespace(
         text,
         min_line_length=config.min_line_length,
         max_consecutive_newlines=config.max_consecutive_newlines,
     )
 
-    # Step 6: 中文标点规范化
+    # Step 7: 中文标点规范化
     text = normalize_chinese_punctuation(text)
 
     return text.strip()
+
+
+# --------------------------------------------------------
+# OpenAPI JSON 解析
+# --------------------------------------------------------
+
+
+def _parse_openapi_json(file_path: Path) -> str:
+    """将 OpenAPI 规范 JSON 文件转换为可检索的文本。
+
+    提取: API 标题、描述、每个端点的 HTTP 方法、路径、摘要、描述、
+          参数名/类型/说明、请求体 schema 属性。
+
+    Args:
+        file_path: OpenAPI JSON 文件路径。
+
+    Returns:
+        格式化的纯文本，适合 embedding。
+    """
+    import json
+
+    with open(file_path, encoding="utf-8") as f:
+        spec = json.load(f)
+
+    lines: list[str] = []
+    info = spec.get("info", {})
+    title = info.get("title", file_path.stem)
+    description = info.get("description", "")
+
+    lines.append(f"## {title}")
+    if description:
+        lines.append(description)
+
+    paths = spec.get("paths", {})
+    if not paths:
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("## API 端点列表")
+    lines.append("")
+
+    for path_url, methods in paths.items():
+        if not isinstance(methods, dict):
+            continue
+        for method, detail in methods.items():
+            if not isinstance(detail, dict):
+                continue
+            method_upper = method.upper()
+            summary = detail.get("summary", "")
+            desc = detail.get("description", "")
+            tags = detail.get("tags", [])
+
+            # 端点标题行
+            tag_str = f" [{', '.join(tags)}]" if tags else ""
+            lines.append(f"### {method_upper} {path_url}{tag_str}")
+            if summary:
+                lines.append(f"**{summary}**")
+            if desc:
+                lines.append(desc)
+
+            # 参数
+            params = detail.get("parameters", [])
+            if params:
+                lines.append("")
+                lines.append("参数:")
+                for p in params:
+                    p_name = p.get("name", "?")
+                    p_in = p.get("in", "")
+                    p_required = " (必填)" if p.get("required") else ""
+                    p_desc = p.get("description", "")
+                    p_type = p.get("schema", {}).get("type", "") if "schema" in p else ""
+                    type_str = f" [{p_type}]" if p_type else ""
+                    lines.append(f"  - `{p_name}` ({p_in}){p_required}{type_str}: {p_desc}")
+
+            # 请求体 schema 属性
+            req_body = detail.get("requestBody", {})
+            if req_body and "content" in req_body:
+                for content_type, content_spec in req_body["content"].items():
+                    schema = content_spec.get("schema", {})
+                    props = schema.get("properties", {})
+                    required_fields = schema.get("required", [])
+                    if props:
+                        lines.append("")
+                        lines.append(f"请求体 ({content_type}):")
+                        for prop_name, prop_spec in props.items():
+                            prop_type = prop_spec.get("type", "")
+                            prop_desc = prop_spec.get("description", "")
+                            req_mark = " (必填)" if prop_name in required_fields else ""
+                            lines.append(f"  - `{prop_name}` [{prop_type}]{req_mark}: {prop_desc}")
+
+            # 响应状态码
+            responses = detail.get("responses", {})
+            if responses:
+                resp_codes = []
+                for code, resp_spec in responses.items():
+                    resp_desc = resp_spec.get("description", "") if isinstance(resp_spec, dict) else ""
+                    resp_codes.append(f"`{code}` {resp_desc}")
+                if resp_codes:
+                    lines.append("")
+                    lines.append(f"响应: {', '.join(resp_codes)}")
+
+            lines.append("")
+
+    return "\n".join(lines)
 
 
 def clean_file(file_path: str | Path, config: CleanConfig | None = None) -> CleanedDocument:
@@ -510,6 +689,28 @@ def clean_file(file_path: str | Path, config: CleanConfig | None = None) -> Clea
     """
     file_path = Path(file_path)
     raw = file_path.read_text(encoding="utf-8")
+
+    # JSON 文件走 OpenAPI 解析通道
+    if file_path.suffix.lower() == ".json":
+        cleaned_body = _parse_openapi_json(file_path)
+        metadata: dict[str, Any] = {
+            "file_name": file_path.name,
+            "file_stem": file_path.stem,
+            "relative_path": str(file_path),
+            "format": "openapi_json",
+        }
+        if config and config.source_root:
+            try:
+                metadata["relative_path"] = str(
+                    file_path.relative_to(config.source_root)
+                )
+            except ValueError:
+                pass
+        return CleanedDocument(
+            content=cleaned_body,
+            metadata=metadata,
+            source_path=str(file_path),
+        )
 
     # 提取 frontmatter
     metadata, body = extract_frontmatter(raw)
