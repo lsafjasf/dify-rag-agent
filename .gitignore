@@ -7,7 +7,15 @@ __pycache__/
 *.egg-info/
 .venv/
 
-
 # IDE
 .idea/
 .vscode/
+
+# 运行时缓存
+cache/
+
+# 本地向量库
+chroma_db/
+
+# 生成输出
+output/
