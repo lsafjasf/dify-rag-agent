@@ -677,6 +677,92 @@ def _parse_openapi_json(file_path: Path) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# 面包屑标签: 根据文件路径生成 category 前缀, 注入 chunk 帮助 embedding 区分文档类型
+# ---------------------------------------------------------------------------
+
+# 路径关键词 → 中文标签映射 (用于面包屑)
+_BREADCRUMB_DIR_LABELS: dict[str, str] = {
+    "learn": "教程",
+    "tutorials": "教程",
+    "cli": "CLI工具",
+    "develop-plugin": "插件开发",
+    "api-reference": "API参考",
+    "guides": "API参考",
+    "nodes": "节点参考",
+    "build": "构建指南",
+    "workspace": "工作区",
+    "knowledge": "知识库",
+    "deploy": "部署指南",
+    "debug": "调试",
+    "publish": "发布",
+    "monitor": "监控",
+    "getting-started": "入门",
+    "trigger": "触发器",
+}
+
+
+def _make_breadcrumb(relative_path: str) -> str:
+    """根据文件相对路径生成面包屑标签。
+
+    标签会被注入到清洗后的正文开头, 随 chunk 一起 embedding,
+    帮助检索时区分易混淆的文档类型 (教程 vs 参考文档, 插件开发 CLI vs difyctl CLI 等)。
+
+    Args:
+        relative_path: 文档相对于 source_root 的路径。
+
+    Returns:
+        类似 "[教程] " 或 "[CLI工具] " 的短标签字符串。
+    """
+    path = relative_path.replace("\\", "/")
+    # 去扩展名, 拆分段
+    if "." in path.split("/")[-1]:
+        path = path.rsplit(".", 1)[0]
+    parts = [p for p in path.split("/") if p and p not in ("cloud", "self-host")]
+
+    # 按优先级匹配标签
+    for p in parts:
+        label = _BREADCRUMB_DIR_LABELS.get(p)
+        if label:
+            return f"[{label}] "
+
+    return ""
+
+
+def _derive_doc_category(breadcrumb: str) -> str:
+    """从面包屑标签推导文档类别 (用于检索加权)。
+
+    Args:
+        breadcrumb: _make_breadcrumb() 的输出, 如 "[教程] " 或 "[节点参考] "。
+
+    Returns:
+        "tutorial" | "reference" | "guide" | "plugin_dev" | "api_spec" | ""
+    """
+    if not breadcrumb:
+        return ""
+    label = breadcrumb.strip("[] \n")
+    return _BREADCRUMB_CATEGORY_MAP.get(label, "")
+
+
+# 面包屑标签 → 文档类别映射
+_BREADCRUMB_CATEGORY_MAP: dict[str, str] = {
+    "教程": "tutorial",
+    "入门": "tutorial",
+    "节点参考": "reference",
+    "API参考": "reference",
+    "构建指南": "reference",
+    "调试": "reference",
+    "触发器": "reference",
+    "部署指南": "guide",
+    "CLI工具": "guide",
+    "工作区": "guide",
+    "知识库": "guide",
+    "发布": "guide",
+    "监控": "guide",
+    "插件开发": "plugin_dev",
+}
+
+
 def clean_file(file_path: str | Path, config: CleanConfig | None = None) -> CleanedDocument:
     """读取并清洗单个文件。
 
@@ -698,6 +784,7 @@ def clean_file(file_path: str | Path, config: CleanConfig | None = None) -> Clea
             "file_stem": file_path.stem,
             "relative_path": str(file_path),
             "format": "openapi_json",
+            "doc_category": "api_spec",
         }
         if config and config.source_root:
             try:
@@ -718,18 +805,28 @@ def clean_file(file_path: str | Path, config: CleanConfig | None = None) -> Clea
     # 清洗正文
     cleaned_body = clean_text(body, config)
 
+    # 计算相对路径
+    relative_path = str(file_path)
+    if config and config.source_root:
+        try:
+            relative_path = str(file_path.relative_to(config.source_root))
+        except ValueError:
+            pass
+
+    # 注入面包屑标签: 在正文开头加上 [教程]/[节点参考]/[CLI工具] 等类别标记，
+    # 让 embedding 能区分文档类型，解决教程碾压参考文档和术语歧义问题。
+    breadcrumb = _make_breadcrumb(relative_path)
+    if breadcrumb:
+        cleaned_body = breadcrumb + cleaned_body
+
+    # 推导文档类别 (用于检索时的加权/过滤)
+    doc_category = _derive_doc_category(breadcrumb)
+
     # 注入文件元信息
     metadata["file_name"] = file_path.name
     metadata["file_stem"] = file_path.stem
-    metadata["relative_path"] = str(file_path)
-
-    if config and config.source_root:
-        try:
-            metadata["relative_path"] = str(
-                file_path.relative_to(config.source_root)
-            )
-        except ValueError:
-            pass
+    metadata["relative_path"] = relative_path
+    metadata["doc_category"] = doc_category
 
     return CleanedDocument(
         content=cleaned_body,

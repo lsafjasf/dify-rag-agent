@@ -74,6 +74,74 @@ def _get_reranker():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# 查询意图 → 文档类别加权
+# ---------------------------------------------------------------------------
+
+# 技术参考类查询的关键词模式 —— 用户想了解"有哪些/是什么/区别"
+_REF_QUERY_PATTERNS = [
+    "支持哪些", "有哪些功能", "有什么功能", "有什么区别", "有什么不同",
+    "有哪些类型", "支持什么", "限制", "版本控制", "参数", "配置选项",
+    "是什么", "做什么", "有什么用", "用途", "功能包括",
+]
+
+# 操作指南类查询 —— 用户想了解"怎么做"
+_HOWTO_QUERY_PATTERNS = [
+    "怎么用", "如何使用", "如何配置", "如何设置", "怎么配置",
+    "怎么设置", "如何创建", "如何安装", "如何部署",
+]
+
+
+def _analyze_query_intent(question: str) -> str:
+    """分析查询意图: reference / howto / neutral。"""
+    ref_score = sum(1 for p in _REF_QUERY_PATTERNS if p in question)
+    howto_score = sum(1 for p in _HOWTO_QUERY_PATTERNS if p in question)
+    if ref_score > howto_score:
+        return "reference"
+    elif howto_score > ref_score:
+        return "howto"
+    return "neutral"
+
+
+def _boost_reference_docs(
+    question: str, docs: list["Document"], top_k: int
+) -> list["Document"]:
+    """对技术参考类查询, 将参考文档排名提升 1-2 位。
+
+    仅当 top-3 中没有 reference 类文档, 且 top_k 内存在 reference 文档时触发。
+    将一个排名最高的 reference 文档交换到第 2 位 (不替换第 1 位, 保守策略)。
+    """
+    intent = _analyze_query_intent(question)
+    if intent != "reference":
+        return docs
+    if len(docs) <= 1:
+        return docs
+
+    # 检查 top-3 中是否已有 reference 文档
+    top_ref = any(
+        d.metadata.get("doc_category") == "reference"
+        for d in docs[:3]
+    )
+    if top_ref:
+        return docs  # 已有参考文档, 无需调整
+
+    # 找排名最高的 reference 文档
+    best_ref_idx = None
+    for i, d in enumerate(docs):
+        if d.metadata.get("doc_category") == "reference":
+            best_ref_idx = i
+            break
+
+    if best_ref_idx is None or best_ref_idx < 3:
+        return docs  # 没有可提升的 reference 文档, 或已在 top-3
+
+    # 将 reference 文档提升到第 2 位 (保留第 1 位不变)
+    ref_doc = docs.pop(best_ref_idx)
+    docs.insert(1, ref_doc)
+
+    return docs[:top_k]
+
+
 def retrieve_docs(
     question: str,
     persist_dir: str = CHROMA_PERSIST_DIR,
@@ -113,7 +181,12 @@ def retrieve_docs(
         bge_reranker=reranker,
     )
 
-    return hybrid.hybrid_search(question, top_k, use_qe=USE_QE)
+    docs = hybrid.hybrid_search(question, top_k, use_qe=USE_QE)
+
+    # Phase 3: 对技术参考类查询提升参考文档排名
+    docs = _boost_reference_docs(question, docs, top_k)
+
+    return docs
 
 
 def _retrieve_fn_for_eval(question: str, k: int = TOP_K):

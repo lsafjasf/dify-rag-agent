@@ -95,19 +95,19 @@ BUILTIN_DATASET: List[EvalSample] = [
     EvalSample(
         question="通过 API 上传文档到知识库后，如何知道文档索引完成了？",
         ground_truth_answer="文档创建是异步的，需要轮询获取文档嵌入状态接口。使用创建文档时返回的 batch ID，不断查询 indexing_status，直到变为 completed 或 error。期间会依次经过 waiting、parsing、cleaning、splitting、indexing 几个阶段。",
-        relevant_sources=["api-reference/guides/knowledge.mdx"],
+        relevant_sources=["api-reference/guides/knowledge.mdx", "api-reference/openapi_knowledge.json"],
         category="知识库",
     ),
     EvalSample(
         question="知识库 API 支持哪些检索方式？",
         ground_truth_answer="知识库 API 支持从知识库检索分段/测试检索接口，可以搜索知识库并返回最相关的分段。生产检索和召回测试共用同一个接口。检索设置（如检索方式、top_k、分数阈值等）可以在创建或更新知识库时配置。",
-        relevant_sources=["api-reference/guides/knowledge.mdx"],
+        relevant_sources=["api-reference/guides/knowledge.mdx", "use-dify/knowledge/create-knowledge/setting-indexing-methods.mdx"],
         category="知识库",
     ),
     EvalSample(
         question="如何通过 API 获取知识库中的文档列表？",
         ground_truth_answer="调用获取知识库的文档列表接口，返回分页列表，支持按关键词或索引状态（indexing_status）筛选。还可以通过获取文档详情接口查看单个文档的索引状态、元数据和处理统计信息。",
-        relevant_sources=["api-reference/guides/knowledge.mdx"],
+        relevant_sources=["api-reference/guides/knowledge.mdx", "api-reference/openapi_knowledge.json"],
         category="知识库",
     ),
 
@@ -139,7 +139,7 @@ BUILTIN_DATASET: List[EvalSample] = [
     EvalSample(
         question="Dify 工作流中的循环节点有什么限制？",
         ground_truth_answer="循环节点用于对数组中的每个元素执行相同的操作。可以设置最大循环次数和超时时间。循环内部可以嵌套其他节点，但需要注意循环嵌套层级的限制和性能影响。支持 break 条件提前退出循环。",
-        relevant_sources=["use-dify/nodes/loop.mdx"],
+        relevant_sources=["use-dify/nodes/loop.mdx", "self-host/deploy/configuration/environments.mdx"],
         category="Workflow",
     ),
     EvalSample(
@@ -239,7 +239,7 @@ BUILTIN_DATASET: List[EvalSample] = [
     EvalSample(
         question="通过 API 上传文件到 Dify 有什么限制？",
         ground_truth_answer="通过上传文件接口可以上传图片、文档、音频或视频文件。文件仅限上传的终端用户使用（通过 user 字段关联）。文件可在发送对话消息时作为附件引用。支持的文件类型和大小限制取决于应用的配置。",
-        relevant_sources=["api-reference/guides/chat.mdx"],
+        relevant_sources=["api-reference/guides/chat.mdx", "use-dify/knowledge/knowledge-pipeline/knowledge-pipeline-orchestration.mdx"],
         category="对话管理",
     ),
 
